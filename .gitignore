@@ -1,0 +1,24 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- 构建产物 ----
+build/
+dist/
+*.spec
+
+# ---- 内置运行时（体积大，按文档自行构建，不纳入版本库） ----
+runtime/
+
+# ---- 本地配置与日志（config.json 可能含 API Key，严禁上传） ----
+config.json
+startup.log
+fault.log
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
