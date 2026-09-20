@@ -16,7 +16,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QTextCursor, QTextCharFormat, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -451,6 +452,477 @@ class CodePanel(QWidget):
             QMessageBox.warning(self, "导出失败", str(e))
 
 
+# ---------------- MCGS 组态面板（独立同级面板） ----------------
+
+class ScadaPanel(QWidget):
+    """MCGS 组态设计助手独立面板。
+
+    功能：
+    1. MCGS 连接按钮：检测本机是否安装 MCGS（McgsPro/嵌入版/通用版），
+       已安装则一键启动；未安装显示提示。
+    2. 版本/协议下拉：McgsPro / 嵌入版 / 通用版 × PPI / Modbus / OPC
+    3. 4 个素材 Tab（占满面板）：变量字典 / 设备通道 / 画面设计书 / 脚本
+    4. 导出包：一键导出 7 个文件到目录
+    """
+
+    def __init__(self, tool_executor: ToolExecutor, config: dict):
+        super().__init__()
+        self._scada = None
+        self.executor = tool_executor
+        self.config = config
+
+        # ========== 顶部：MCGS 连接区 ==========
+        self.btn_connect_mcgs = QPushButton("🔌 连接 MCGS")
+        self.btn_connect_mcgs.setToolTip("自动检测本机 MCGS 安装位置（注册表→快捷方式→全盘搜索）")
+        self.lbl_mcgs_status = QLabel("未检测到 MCGS")
+        self.lbl_mcgs_status.setStyleSheet("color: #999;")
+        self.btn_start_mcgs = QPushButton("▶ 启动 MCGS")
+        self.btn_start_mcgs.setEnabled(False)
+        self.btn_start_mcgs.setToolTip("启动已安装的 MCGS 组态软件")
+        self.lbl_mcgs_path = QLabel("")
+        self.lbl_mcgs_path.setStyleSheet("color: #1a7f37;")
+        self.mcgs_exe_path = None
+
+        conn_row = QHBoxLayout()
+        conn_row.addWidget(self.btn_connect_mcgs)
+        conn_row.addWidget(self.lbl_mcgs_status)
+        conn_row.addWidget(self.btn_start_mcgs)
+        conn_row.addWidget(self.lbl_mcgs_path, 1)
+
+        # ========== 中部：生成控制条 ==========
+        self.cmb_version = QComboBox()
+        self.cmb_version.addItems(["McgsPro", "嵌入版", "通用版"])
+        self.cmb_protocol = QComboBox()
+        self.cmb_protocol.addItems(["PPI", "Modbus", "OPC"])
+        self.btn_generate = QPushButton("⚡ 生成组态素材")
+        self.btn_generate.setToolTip("按当前版本/协议，用默认工艺描述生成组态素材")
+        self.btn_generate.setStyleSheet(
+            "QPushButton{background:#1a7f37;color:white;padding:6px 16px;font-weight:bold;}"
+            "QPushButton:hover{background:#15662b;}"
+        )
+        self.btn_export = QPushButton("📦 导出包")
+        self.btn_export.setToolTip("将当前素材导出为 7 个文件到指定目录")
+        self.btn_auto_write = QPushButton("🔄 写入 MCGS")
+        self.btn_auto_write.setToolTip("自动写入 MCGS（需先启动 MCGS，UI 自动化）")
+        self.btn_auto_write.setStyleSheet(
+            "QPushButton{background:#0969da;color:white;padding:6px 16px;font-weight:bold;}"
+            "QPushButton:hover{background:#0550ae;}"
+        )
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel("版本"))
+        ctrl_row.addWidget(self.cmb_version)
+        ctrl_row.addWidget(QLabel("协议"))
+        ctrl_row.addWidget(self.cmb_protocol)
+        ctrl_row.addStretch(1)
+        ctrl_row.addWidget(self.btn_generate)
+        ctrl_row.addWidget(self.btn_export)
+        ctrl_row.addWidget(self.btn_auto_write)
+
+        # ========== 自动化进度条（默认隐藏） ==========
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 3)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v/3  %p%")
+        self.progress_bar.setVisible(False)
+        self.lbl_progress = QLabel("")
+        self.lbl_progress.setStyleSheet("color: #0969da; font-weight: bold;")
+
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(QLabel("自动化进度："))
+        progress_row.addWidget(self.progress_bar, 1)
+        progress_row.addWidget(self.lbl_progress)
+        progress_container = QWidget()
+        progress_container.setLayout(progress_row)
+        progress_container.setVisible(False)
+        self._progress_container = progress_container
+
+        # ========== 4 个素材 Tab（占满剩余空间） ==========
+        self.material_tabs = QTabWidget()
+
+        # --- Tab 1：变量字典 ---
+        var_tab = QWidget()
+        self.tbl_vars = QTableWidget(0, 6)
+        self.tbl_vars.setHorizontalHeaderLabels(
+            ["变量名", "类型", "地址", "数据类型", "读写", "说明"]
+        )
+        self.tbl_vars.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.tbl_vars.verticalHeader().setDefaultSectionSize(32)
+        btn_copy_vars = QPushButton("📋 复制 CSV")
+        btn_copy_vars.clicked.connect(self._copy_vars_csv)
+        var_lay = QVBoxLayout(var_tab)
+        var_lay.addWidget(self.tbl_vars, 1)
+        var_btn_row = QHBoxLayout()
+        var_btn_row.addStretch(1)
+        var_btn_row.addWidget(btn_copy_vars)
+        var_lay.addLayout(var_btn_row)
+        self.material_tabs.addTab(var_tab, "📋 变量字典")
+
+        # --- Tab 2：设备通道 CSV ---
+        csv_tab = QWidget()
+        self.txt_csv = QPlainTextEdit()
+        self.txt_csv.setReadOnly(True)
+        font = self.txt_csv.font()
+        font.setFamily("Consolas, Courier New")
+        font.setPointSize(font.pointSize() + 1)
+        self.txt_csv.setFont(font)
+        btn_copy_csv = QPushButton("📋 复制 CSV")
+        btn_copy_csv.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(self.txt_csv.toPlainText())
+        )
+        csv_lay = QVBoxLayout(csv_tab)
+        csv_lay.addWidget(self.txt_csv, 1)
+        csv_btn_row = QHBoxLayout()
+        csv_btn_row.addStretch(1)
+        csv_btn_row.addWidget(btn_copy_csv)
+        csv_lay.addLayout(csv_btn_row)
+        self.material_tabs.addTab(csv_tab, "🔌 设备通道 CSV")
+
+        # --- Tab 3：画面设计书 ---
+        screen_tab = QWidget()
+        self.txt_screen = QTextBrowser()
+        self.txt_screen.setOpenExternalLinks(False)
+        btn_copy_screen = QPushButton("📋 复制设计书")
+        btn_copy_screen.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(self.txt_screen.toPlainText())
+        )
+        screen_lay = QVBoxLayout(screen_tab)
+        screen_lay.addWidget(self.txt_screen, 1)
+        screen_btn_row = QHBoxLayout()
+        screen_btn_row.addStretch(1)
+        screen_btn_row.addWidget(btn_copy_screen)
+        screen_lay.addLayout(screen_btn_row)
+        self.material_tabs.addTab(screen_tab, "🖼 画面设计书")
+
+        # --- Tab 4：McgsScript 脚本 ---
+        script_tab = QWidget()
+        self.txt_script = QPlainTextEdit()
+        self.txt_script.setReadOnly(True)
+        sc_font = self.txt_script.font()
+        sc_font.setFamily("Consolas, Courier New")
+        sc_font.setPointSize(sc_font.pointSize() + 1)
+        self.txt_script.setFont(sc_font)
+        btn_copy_script = QPushButton("📋 复制脚本")
+        btn_copy_script.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(self.txt_script.toPlainText())
+        )
+        script_lay = QVBoxLayout(script_tab)
+        script_lay.addWidget(self.txt_script, 1)
+        script_btn_row = QHBoxLayout()
+        script_btn_row.addStretch(1)
+        script_btn_row.addWidget(btn_copy_script)
+        script_lay.addLayout(script_btn_row)
+        self.material_tabs.addTab(script_tab, "📝 McgsScript 脚本")
+
+        # ========== 全局布局 ==========
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addLayout(conn_row)
+        layout.addLayout(ctrl_row)
+        layout.addWidget(self._progress_container)
+        layout.addWidget(self.material_tabs, 1)
+
+        # ========== 信号 ==========
+        self.btn_connect_mcgs.clicked.connect(self._connect_mcgs)
+        self.btn_start_mcgs.clicked.connect(self._start_mcgs)
+        self.btn_generate.clicked.connect(self._generate_now)
+        self.btn_export.clicked.connect(self.export_package)
+        self.btn_auto_write.clicked.connect(self._auto_write_to_mcgs)
+
+        # ========== 初始化版本/协议下拉 ==========
+        mcgs_cfg = config.get("mcgs", {})
+        vi = self.cmb_version.findText(mcgs_cfg.get("version", "McgsPro"))
+        if vi >= 0:
+            self.cmb_version.setCurrentIndex(vi)
+        pi = self.cmb_protocol.findText(mcgs_cfg.get("protocol", "PPI"))
+        if pi >= 0:
+            self.cmb_protocol.setCurrentIndex(pi)
+
+        # ========== 首次自动检测 MCGS ==========
+        self._connect_mcgs()
+
+    # ---------- MCGS 连接按钮 ----------
+    def _connect_mcgs(self):
+        """分层检测本机 MCGS 安装路径（注册表 > 快捷方式 > 全盘搜索）。"""
+        from app.scada import find_mcgs_installed
+        self.lbl_mcgs_status.setText("检测中……")
+        self.lbl_mcgs_status.setStyleSheet("color: #999;")
+        self.lbl_mcgs_path.setText("")
+        QGuiApplication.processEvents()
+
+        ver, path = find_mcgs_installed()
+
+        if ver and path:
+            self.mcgs_exe_path = path
+            self.lbl_mcgs_status.setText(f"✓ {ver}")
+            self.lbl_mcgs_status.setStyleSheet("color: #1a7f37; font-weight: bold;")
+            self.lbl_mcgs_path.setText(f"📁 {path}")
+            self.btn_start_mcgs.setEnabled(True)
+            idx = self.cmb_version.findText(ver)
+            if idx >= 0:
+                self.cmb_version.setCurrentIndex(idx)
+        else:
+            self.mcgs_exe_path = None
+            self.lbl_mcgs_status.setText("✗ 未检测到")
+            self.lbl_mcgs_status.setStyleSheet("color: #c62828;")
+            self.lbl_mcgs_path.setText(
+                "已扫描注册表/快捷方式/全盘，未找到 MCGS。"
+                "请确认已安装，或手动选择版本后点生成。"
+            )
+            self.btn_start_mcgs.setEnabled(False)
+
+    def _manual_locate_mcgs(self):
+        """用户通过文件对话框手动选择 MCGS exe 路径。"""
+        import os
+        from app.scada.mcgs_knowledge import _detect_version_from_exe_path
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 MCGS 组态软件", "",
+            "可执行文件 (*.exe);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "路径无效", f"文件不存在：\n{path}")
+            return
+        ver = _detect_version_from_exe_path(path)
+        self.mcgs_exe_path = path
+        self.lbl_mcgs_status.setText(f"✓ {ver}")
+        self.lbl_mcgs_status.setStyleSheet("color: #1a7f37; font-weight: bold;")
+        self.lbl_mcgs_path.setText(f"📁 {path}（手动定位）")
+        self.btn_start_mcgs.setEnabled(True)
+        idx = self.cmb_version.findText(ver)
+        if idx >= 0:
+            self.cmb_version.setCurrentIndex(idx)
+
+    def _start_mcgs(self):
+        """启动 MCGS 组态软件（独立进程）。"""
+        if not self.mcgs_exe_path:
+            return
+        import subprocess
+        try:
+            subprocess.Popen(
+                [self.mcgs_exe_path],
+                cwd=self.mcgs_exe_path.rsplit("\\", 1)[0],
+            )
+            self.lbl_mcgs_version.setText(
+                f"已启动 {self.lbl_mcgs_status.text().replace('已检测到 ', '')}，"
+                f"请在 MCGS 组态环境中打开/新建工程。"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "启动失败", str(e))
+
+    # ---------- 生成组态 ----------
+    def _generate_now(self):
+        """按当前版本/协议生成组态素材，自动刷新 4 个 Tab。"""
+        version = self.cmb_version.currentText()
+        protocol = self.cmb_protocol.currentText()
+        self.btn_generate.setEnabled(False)
+        self.btn_generate.setText("生成中……")
+        QGuiApplication.processEvents()
+        try:
+            self.executor.generate_scada(
+                craft_desc="电机启停控制，带运行指示与故障报警",
+                mcgs_version=version,
+                protocol=protocol,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "生成失败", str(e))
+        finally:
+            self.btn_generate.setEnabled(True)
+            self.btn_generate.setText("⚡ 生成组态素材")
+
+    # ---------- 渲染 ----------
+    def show_scada(self, scada: dict):
+        """渲染 scada dict 到 4 个素材 Tab。"""
+        self._scada = scada
+        name = scada.get("name", "MCGS组态")
+        version = scada.get("mcgs_version", "McgsPro")
+        protocol = scada.get("protocol", "PPI")
+        vi = self.cmb_version.findText(version)
+        if vi >= 0:
+            self.cmb_version.setCurrentIndex(vi)
+        pi = self.cmb_protocol.findText(protocol)
+        if pi >= 0:
+            self.cmb_protocol.setCurrentIndex(pi)
+
+        # 变量字典表
+        self.tbl_vars.setRowCount(0)
+        for v in scada["variables"]:
+            row = self.tbl_vars.rowCount()
+            self.tbl_vars.insertRow(row)
+            rw = "只读" if v.get("read_only") else "读写"
+            cells = [v["name"], v.get("var_type", ""), v["address"],
+                     v.get("dtype", ""), rw, v.get("comment", "")]
+            for col, text in enumerate(cells):
+                self.tbl_vars.setItem(row, col, QTableWidgetItem(str(text)))
+
+        # 通道 CSV
+        self.txt_csv.setPlainText(scada["device_channels_csv"])
+
+        # 画面设计书 + SVG 源码（QTextBrowser 不直接渲染 SVG，降级为代码块）
+        design_md = scada["screen_design"]["design_text"]
+        svg = scada["screen_design"]["svg_preview"]
+        self.txt_screen.setMarkdown(design_md)
+        self.txt_screen.append(
+            "\n\n---\n\n**SVG 布局示意（源码，可另存为 .svg 浏览）：**\n\n```svg\n"
+            + svg + "\n```"
+        )
+
+        # 脚本
+        self.txt_script.setPlainText(scada["script"])
+
+        # 自动切到变量字典 Tab
+        self.material_tabs.setCurrentIndex(0)
+
+        # 弹窗提示（ScadaPanel 没有状态栏，用消息框通知）
+        QMessageBox.information(
+            self, "✓ 组态素材已生成",
+            f"{name}\n版本：{version} · 协议：{protocol}\n"
+            f"变量数：{len(scada['variables'])}\n\n"
+            f"请按顺序操作：\n"
+            f"  ① 切到「设备通道 CSV」Tab，复制后到 MCGS 设备窗口右键「设备信息导入」\n"
+            f"  ② 切到「变量字典」Tab，对照在 MCGS 实时数据库逐条新建数据对象\n"
+            f"  ③ 切到「McgsScript 脚本」Tab，复制粘贴到 MCGS 脚本编辑器\n"
+            f"  ④ 或点右上角「📦 导出包」一键导出 7 个文件到目录",
+        )
+
+    # ---------- 导出 ----------
+    def export_package(self):
+        if not self._scada:
+            QMessageBox.information(self, "提示", "尚未生成 MCGS 组态，无内容可导出。")
+            return
+        target = QFileDialog.getExistingDirectory(
+            self, "选择导出目录", f"{self._scada['name']}_导出包"
+        )
+        if not target:
+            return
+        try:
+            from app.scada import build_export_package
+            files = build_export_package(self._scada, target)
+            names = "\n".join(f"- {n}" for n in files)
+            QMessageBox.information(
+                self, "导出成功",
+                f"已导出 {len(files)} 个文件到：\n{target}\n\n{names}\n\n"
+                "导入顺序请查阅目录中的 README.txt。",
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+
+    def _copy_vars_csv(self):
+        if not self._scada:
+            return
+        import csv, io
+        out = io.StringIO()
+        out.write("\ufeff")
+        writer = csv.writer(out)
+        writer.writerow(["变量名", "类型", "地址", "数据类型", "初值", "读写", "说明"])
+        for v in self._scada["variables"]:
+            rw = "只读" if v.get("read_only") else "读写"
+            writer.writerow([v["name"], v.get("var_type", ""), v["address"],
+                             v.get("dtype", ""), v.get("init", "0"), rw, v.get("comment", "")])
+        QGuiApplication.clipboard().setText(out.getvalue())
+
+    # ---------- 自动写入 MCGS ----------
+    def _auto_write_to_mcgs(self):
+        """用 UI 自动化把当前 scada 写入 MCGS 工程。
+
+        在后台线程执行，通过信号更新进度。
+        """
+        if not self._scada:
+            QMessageBox.information(self, "提示", "尚未生成 MCGS 组态素材，先点「⚡ 生成组态素材」。")
+            return
+
+        from PySide6.QtCore import QThread, Signal
+
+        # 确认对话框
+        btn = QMessageBox.question(
+            self, "🔄 自动写入 MCGS",
+            "将通过 UI 自动化把组态素材写入 MCGS 工程，包含 3 个步骤：\n\n"
+            "  ① 启动/激活 MCGS 组态环境\n"
+            "  ② 自动导入设备通道 CSV\n"
+            "  ③ 自动粘贴 McgsScript 脚本\n\n"
+            "⚠ 数据对象（变量）创建无法自动化，需手动在实时数据库新建。\n\n"
+            "请确保 MCGS 组态环境已打开（或允许自动启动），然后点「是」继续。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if btn != QMessageBox.StandardButton.Yes:
+            return
+
+        # 创建后台线程执行
+        class WriteWorker(QThread):
+            progress = Signal(int, str)
+            finished_all = Signal(list)  # List[StepResult]
+
+            def __init__(self, scada, mcgs_path):
+                super().__init__()
+                self.scada = scada
+                self.mcgs_path = mcgs_path
+
+            def run(self):
+                try:
+                    from app.scada import MCGSAutoWriter
+                    writer = MCGSAutoWriter(self.scada, self.mcgs_path)
+                    results = writer.run(
+                        on_progress=lambda s, m: self.progress.emit(s, m)
+                    )
+                    self.finished_all.emit(results)
+                except Exception as e:
+                    # 构造一个失败的结果
+                    from app.scada.mcgs_auto_writer import StepResult
+                    self.finished_all.emit([StepResult(0, "执行异常", False, message=str(e))])
+
+        self._progress_container.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.lbl_progress.setText("准备中……")
+        self.btn_auto_write.setEnabled(False)
+
+        self._write_worker = WriteWorker(self._scada, self.mcgs_exe_path)
+        self._write_worker.progress.connect(self._on_write_progress)
+        self._write_worker.finished_all.connect(self._on_write_finished)
+        self._write_worker.start()
+
+    def _on_write_progress(self, step: int, message: str):
+        self.progress_bar.setValue(step)
+        self.lbl_progress.setText(f"步骤 {step}/3：{message}")
+
+    def _on_write_finished(self, results: list):
+        self.btn_auto_write.setEnabled(True)
+        self.progress_bar.setValue(3)
+        self.lbl_progress.setText("自动化完成")
+
+        # 汇总结果
+        success_count = sum(1 for r in results if r.success)
+        manual_count = sum(1 for r in results if r.manual)
+        fail_count = sum(1 for r in results if not r.success and not r.manual)
+
+        lines = ["📋 自动化执行结果：\n"]
+        for r in results:
+            icon = "✅" if r.success else ("✍️" if r.manual else "❌")
+            status = "成功" if r.success else ("需手动" if r.manual else "失败")
+            lines.append(f"  {icon} Step {r.step}: {r.name} — {status}")
+            if r.message:
+                lines.append(f"     {r.message}")
+
+        summary = f"\n成功 {success_count} / 需手动 {manual_count} / 失败 {fail_count}"
+        lines.append(summary)
+
+        if fail_count > 0:
+            QMessageBox.warning(self, "🔄 自动写入完成（部分失败）", "\n".join(lines))
+        elif manual_count > 0:
+            QMessageBox.information(self, "🔄 自动写入完成", "\n".join(lines))
+        else:
+            QMessageBox.information(self, "🔄 自动写入成功", "\n".join(lines))
+
+        # 3 秒后隐藏进度条
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(3000, lambda: self._progress_container.setVisible(False))
+
+
 # ---------------- 设置对话框 ----------------
 
 class SettingsDialog(QWidget):
@@ -614,11 +1086,13 @@ class SettingsDialog(QWidget):
 class MainWindow(QMainWindow):
     # 程序就绪信号：工具在工作线程产出程序后，经队列连接回到 GUI 线程刷新
     program_ready = Signal(dict)
+    # MCGS 组态就绪信号
+    scada_ready = Signal(dict)
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("STEP 7 AI Agent")
-        self.resize(1180, 760)
+        self.setWindowTitle("STEP 7 AI Agent  |  MCGS 组态助手")
+        self.resize(1280, 820)
 
         self.config = load_config()
         self.executor = ToolExecutor()
@@ -627,29 +1101,57 @@ class MainWindow(QMainWindow):
         self.chat = ChatPanel()
         self.plc_panel = PlcPanel(self.executor)
         self.code_panel = CodePanel()
+        self.scada_panel = ScadaPanel(self.executor, self.config)
         self.plc_panel.sync_from_config(self.config)
         self.executor.allow_write = self.config["plc"].get("allow_write", False)
 
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self.plc_panel, "PLC")
-        self.tabs.addTab(self.code_panel, "程序")
+        # ---- 顶层 Tab：STEP 7 AI Agent 与 MCGS 组态助手同级 ----
+        self.top_tabs = QTabWidget()
 
+        # Tab 0：STEP 7 AI Agent（对话 + PLC/程序面板）
+        step7_tabs = QTabWidget()
+        step7_tabs.addTab(self.plc_panel, "PLC")
+        step7_tabs.addTab(self.code_panel, "程序")
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.chat)
-        splitter.addWidget(self.tabs)
+        splitter.addWidget(step7_tabs)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        self.setCentralWidget(splitter)
+        self.top_tabs.addTab(splitter, "STEP 7 AI Agent")
 
-        # 跨线程写确认
+        # Tab 1：MCGS 组态助手（独立面板）
+        self.top_tabs.addTab(self.scada_panel, "MCGS 组态助手")
+
+        # Tab 2：运行日志（应用内实时查看）
+        self._build_log_tab()
+        self.top_tabs.addTab(self._log_tab_widget, "📋 运行日志")
+
+        self.setCentralWidget(self.top_tabs)
+
+        # ---- 注册日志信号桥（让所有 logging 记录实时流入 UI） ----
+        try:
+            from app.core.logger import QtLogEmitter, set_log_emitter, tail_log
+            self._log_emitter = QtLogEmitter()
+            set_log_emitter(self._log_emitter)
+            self._log_emitter.log_record.connect(self._on_log_record)
+            # 先加载历史
+            for line in tail_log(200):
+                self.txt_log.append(line.rstrip())
+        except Exception:
+            pass
+
+        # ---- 跨线程写确认 ----
         self._confirm_bridge = ConfirmBridge()
         self.executor.confirm_write = self._confirm_write
         self.executor.on_connection_changed = self._on_connection_changed
-        # 程序刷新统一走信号（emit 可能来自工作线程，自动使用队列连接）
+        # 程序刷新统一走信号
         self.program_ready.connect(self.code_panel.show_program)
         self.executor.on_program_generated = self.program_ready.emit
+        # MCGS 组态刷新走信号 → ScadaPanel
+        self.scada_ready.connect(self.scada_panel.show_scada)
+        self.executor.on_scada_generated = self.scada_ready.emit
 
-        # 信号连接
+        # ---- 信号连接 ----
         self.chat.btn_send.clicked.connect(self._send_message)
         self.plc_panel.btn_mock.clicked.connect(self._toggle_mock)
         self.plc_panel.btn_connect.clicked.connect(self._toggle_connect)
@@ -684,6 +1186,8 @@ class MainWindow(QMainWindow):
         act_settings.triggered.connect(self._open_settings)
         act_clear = toolbar.addAction("清空对话")
         act_clear.triggered.connect(self._clear_chat)
+        act_scada = toolbar.addAction("MCGS 组态")
+        act_scada.triggered.connect(self._open_scada_dialog)
         act_about = toolbar.addAction("关于")
         act_about.triggered.connect(self._show_about)
 
@@ -759,6 +1263,7 @@ class MainWindow(QMainWindow):
         self._worker.tool.connect(self._on_tool_event)
         self._worker.error.connect(self._on_error)
         self._worker.program.connect(self.code_panel.show_program)
+        self._worker.scada.connect(self.scada_panel.show_scada)
         self._worker.finished.connect(self._on_finished)
         self._thread.start()
 
@@ -873,8 +1378,81 @@ class MainWindow(QMainWindow):
             "西门子 S7 系列 PLC 的 AI 编程与通信助手\n"
             "支持 S7-200 SMART / S7-1200/1500 / S7-300/400\n"
             "模型后端：Ollama 本地 / OpenAI 兼容云端\n\n"
+            "MCGS 组态设计助手：派生变量字典/通道CSV/画面设计书/McgsScript脚本\n"
+            "支持 嵌入版 + 通用版，协议 PPI / Modbus / OPC\n\n"
             "安全提示：真机写入须人工确认，下载前请先编译与仿真。",
         )
+
+    # ---------- MCGS 组态独立入口 ----------
+    def _open_scada_dialog(self):
+        """弹工艺描述输入对话框 + 版本/协议下拉，确认后直接调工具生成组态。"""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("MCGS 组态设计助手")
+        dlg.setMinimumWidth(480)
+        form = QFormLayout()
+        edt_craft = QPlainTextEdit()
+        edt_craft.setPlaceholderText(
+            "请描述工艺需求，如：\n"
+            "电机启停控制，带故障指示与运行状态\n"
+            "传送带计数，累计产量保存\n"
+            "也可直接写明地址（如 I0.0 启动 / Q0.0 运行 / VW100 设定值）"
+        )
+        edt_craft.setFixedHeight(120)
+        cmb_v = QComboBox()
+        cmb_v.addItems(["McgsPro", "嵌入版", "通用版"])
+        cmb_v.setCurrentText(self.scada_panel.cmb_version.currentText())
+        cmb_p = QComboBox()
+        cmb_p.addItems(["PPI", "Modbus", "OPC"])
+        cmb_p.setCurrentText(self.scada_panel.cmb_protocol.currentText())
+        form.addRow("工艺描述：", edt_craft)
+        form.addRow("MCGS 版本：", cmb_v)
+        form.addRow("协议：", cmb_p)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay = QVBoxLayout(dlg)
+        lay.addLayout(form)
+        lay.addWidget(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        craft = edt_craft.toPlainText().strip()
+        if not craft:
+            QMessageBox.information(self, "提示", "请填写工艺描述。")
+            return
+        version = cmb_v.currentText()
+        protocol = cmb_p.currentText()
+        # 同步到 scada_panel 下拉
+        vi = self.scada_panel.cmb_version.findText(version)
+        if vi >= 0:
+            self.scada_panel.cmb_version.setCurrentIndex(vi)
+        pi = self.scada_panel.cmb_protocol.findText(protocol)
+        if pi >= 0:
+            self.scada_panel.cmb_protocol.setCurrentIndex(pi)
+        # 持久化到 config
+        self.config.setdefault("mcgs", {})
+        self.config["mcgs"]["version"] = version
+        self.config["mcgs"]["protocol"] = protocol
+        save_config(self.config)
+        # 直接调工具（同步执行，完成后通过回调走 scada_ready 信号刷新 GUI）
+        self.statusBar().showMessage(f"正在生成 MCGS 组态（{version}·{protocol}）……", 3000)
+        try:
+            text = self.executor.generate_scada(
+                craft_desc=craft,
+                mcgs_version=version,
+                protocol=protocol,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "生成失败", str(e))
+            return
+        # 切到 MCGS 组态助手 tab
+        self.top_tabs.setCurrentIndex(1)
+        # 把工具返回的 markdown 文本塞进对话区
+        self.chat.add_message("user", f"（MCGS 组态）{craft}（版本：{version}，协议：{protocol}）")
+        self.chat.add_message("assistant", text)
+        self.statusBar().showMessage("MCGS 组态已生成，请在「MCGS 组态助手」面板查看。", 5000)
 
     # ---------- 配置持久化 ----------
     def _persist_plc_config(self):
@@ -890,6 +1468,135 @@ class MainWindow(QMainWindow):
         return self._confirm_bridge.ask(address, str(value))
 
     # ---------- 关闭清理 ----------
+    # ---------- 运行日志 Tab ----------
+    def _build_log_tab(self):
+        """构建应用内日志查看器 Tab。"""
+        self._log_tab_widget = QWidget()
+
+        # 日志文本框（带颜色高亮）
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
+        log_font = self.txt_log.font()
+        log_font.setFamily("Consolas, Courier New")
+        self.txt_log.setFont(log_font)
+
+        # 过滤控件
+        self.chk_show_debug = QCheckBox("DEBUG")
+        self.chk_show_debug.setChecked(False)
+        self.chk_show_info = QCheckBox("INFO")
+        self.chk_show_info.setChecked(True)
+        self.chk_show_warn = QCheckBox("WARNING")
+        self.chk_show_warn.setChecked(True)
+        self.chk_show_error = QCheckBox("ERROR")
+        self.chk_show_error.setChecked(True)
+        self.chk_auto_scroll = QCheckBox("自动滚动")
+        self.chk_auto_scroll.setChecked(True)
+        self.chk_show_debug.toggled.connect(lambda: self._apply_log_filter())
+        self.chk_show_info.toggled.connect(lambda: self._apply_log_filter())
+        self.chk_show_warn.toggled.connect(lambda: self._apply_log_filter())
+        self.chk_show_error.toggled.connect(lambda: self._apply_log_filter())
+
+        btn_clear = QPushButton("清空")
+        btn_clear.clicked.connect(lambda: self.txt_log.clear())
+        btn_copy = QPushButton("复制全部")
+        btn_copy.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(self.txt_log.toPlainText())
+        )
+        btn_open_file = QPushButton("打开日志文件")
+        btn_open_file.clicked.connect(self._open_log_file)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("显示级别："))
+        filter_row.addWidget(self.chk_show_debug)
+        filter_row.addWidget(self.chk_show_info)
+        filter_row.addWidget(self.chk_show_warn)
+        filter_row.addWidget(self.chk_show_error)
+        filter_row.addStretch(1)
+        filter_row.addWidget(self.chk_auto_scroll)
+        filter_row.addWidget(btn_clear)
+        filter_row.addWidget(btn_copy)
+        filter_row.addWidget(btn_open_file)
+
+        lay = QVBoxLayout(self._log_tab_widget)
+        lay.addLayout(filter_row)
+        lay.addWidget(self.txt_log, 1)
+
+        # 缓存所有日志记录（用于过滤）
+        self._all_log_records: list = []
+
+    def _on_log_record(self, level: int, time_str: str, logger: str, message: str):
+        """Qt 信号槽：接收一条 logging 记录并追加到 UI。"""
+        import logging
+        self._all_log_records.append((level, time_str, logger, message))
+        self._append_log_line(level, time_str, logger, message)
+
+    def _append_log_line(self, level: int, time_str: str, logger: str, message: str):
+        """追加一行带颜色的日志。"""
+        # 级别过滤
+        import logging
+        if level == logging.DEBUG and not self.chk_show_debug.isChecked():
+            return
+        if level == logging.INFO and not self.chk_show_info.isChecked():
+            return
+        if level == logging.WARNING and not self.chk_show_warn.isChecked():
+            return
+        if level >= logging.ERROR and not self.chk_show_error.isChecked():
+            return
+
+        # 颜色
+        color_map = {
+            logging.DEBUG: QColor(128, 128, 128),   # 灰色
+            logging.INFO: QColor(30, 30, 30),       # 黑色
+            logging.WARNING: QColor(200, 120, 0),   # 橙色
+            logging.ERROR: QColor(200, 0, 0),       # 红色
+            logging.CRITICAL: QColor(150, 0, 150),  # 紫色
+        }
+        color = color_map.get(level, QColor(0, 0, 0))
+
+        # 级别名
+        name_map = {
+            logging.DEBUG: "DEBUG",
+            logging.INFO: "INFO",
+            logging.WARNING: "WARN",
+            logging.ERROR: "ERROR",
+            logging.CRITICAL: "CRIT",
+        }
+        level_name = name_map.get(level, str(level))
+
+        line = f"[{time_str}] [{level_name}] [{logger}] {message}"
+
+        # 带 color 的追加
+        fmt = QTextCharFormat()
+        fmt.setForeground(color)
+        self.txt_log.moveCursor(QTextCursor.MoveOperation.End)
+        self.txt_log.setCurrentCharFormat(fmt)
+        self.txt_log.insertPlainText(line + "\n")
+        self.txt_log.setCurrentCharFormat(QTextCharFormat())  # 恢复默认
+
+        # 自动滚动
+        if self.chk_auto_scroll.isChecked():
+            self.txt_log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _apply_log_filter(self):
+        """重新应用过滤：清空后按过滤条件重绘所有缓存记录。"""
+        self.txt_log.clear()
+        for rec in self._all_log_records:
+            self._append_log_line(*rec)
+
+    def _open_log_file(self):
+        """用系统默认程序打开 app.log。"""
+        try:
+            from app.core.logger import _log_file
+            import os, subprocess
+            path = _log_file()
+            if os.path.isfile(path):
+                os.startfile(path)
+            else:
+                QMessageBox.information(self, "日志文件不存在",
+                                        f"日志文件尚未生成：{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "打开失败", str(e))
+
     def closeEvent(self, event):
         if self._conn_thread is not None:
             self._conn_thread.quit()

@@ -11,6 +11,7 @@ class ChatWorker(QObject):
     tool = Signal(str, str)
     error = Signal(str)
     program = Signal(dict)
+    scada = Signal(dict)
     finished = Signal()
 
     def __init__(self, assistant, text: str):
@@ -31,6 +32,8 @@ class ChatWorker(QObject):
                 self.error.emit(args[0])
             elif kind == "program":
                 self.program.emit(args[0])
+            elif kind == "scada":
+                self.scada.emit(args[0])
 
         try:
             self._assistant.chat(self._text, event)

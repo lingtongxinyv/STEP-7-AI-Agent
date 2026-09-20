@@ -28,6 +28,8 @@
 - 🔍 **模型连通性测试**：分级检测服务可达性 → 鉴权 → 模型存在性 → 极简推理，显示响应耗时
 - 🛡️ **安全门禁**：默认只读；写入须勾选授权并逐条弹窗确认
 - 🎓 **工程 / 学习双模式**：工程模式直接给方案，学习模式引导提问、启发思考
+- 🖥️ **MCGS 组态设计助手**：从 PLC 程序或工艺描述派生组态素材（变量字典 / 设备通道 CSV / 画面设计书 / McgsScript），支持 McgsPro / 嵌入版 / 通用版 × PPI / Modbus / OPC，可一键自动写入 MCGS
+- 📋 **应用内日志查看器**：统一日志系统（文件 + 控制台 + 实时 UI），带级别过滤与颜色高亮，启动错误一目了然
 - 📦 **单文件 exe**：PyInstaller 打包，拷贝到其他 Windows 电脑双击即用，免安装
 
 ## 🚀 快速开始
@@ -100,10 +102,13 @@ python main.py
 .
 ├── main.py                    # 程序入口（软件渲染、全局异常钩子）
 ├── 启动.bat                   # 内置运行时一键启动
+├── 测试启动.bat               # 调试启动（保留控制台输出）
 ├── requirements.txt
 ├── build_exe.ps1              # 一键打包脚本
 ├── app/
-│   ├── core/config.py         # 配置管理
+│   ├── core/
+│   │   ├── config.py          # 配置管理
+│   │   └── logger.py          # 统一日志（文件 + 控制台 + Qt 信号）
 │   ├── plc/
 │   │   ├── profiles.py        # 设备型号配置（4 类）
 │   │   ├── address.py         # 变量地址解析
@@ -113,13 +118,19 @@ python main.py
 │   │   ├── templates.py       # 模板库 + 内联代码解析
 │   │   ├── ladder.py          # 梯形图模型/绘制 + .awl 导出
 │   │   └── stl_parser.py      # STL → 梯形图自动解析
+│   ├── scada/                 # MCGS 组态设计助手
+│   │   ├── mcgs_knowledge.py  # MCGS 知识库（语法/驱动/CSV 格式）
+│   │   ├── mcgs_csv.py        # 11 列设备通道 CSV 构建器
+│   │   ├── mcgs_script.py     # McgsScript 脚本生成
+│   │   ├── mcgs_templates.py  # 素材派生主入口
+│   │   └── mcgs_auto_writer.py# MCGS UI 自动化写入
 │   ├── agent/
 │   │   ├── prompts.py         # 双模式系统提示词
 │   │   ├── tools.py           # 工具定义与执行器
 │   │   ├── connectivity.py    # 模型连通性测试
 │   │   └── assistant.py       # 对话核心（流式 + 工具循环）
 │   └── ui/
-│       ├── main_window.py     # 主窗口
+│       ├── main_window.py     # 主窗口（STEP7 | MCGS | 日志 三 Tab）
 │       └── workers.py         # 后台线程 Worker
 └── 使用文档.md
 ```

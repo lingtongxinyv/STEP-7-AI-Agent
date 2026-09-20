@@ -17,6 +17,12 @@ from app.programs.templates import (
     render,
     render_for_chat,
 )
+from app.scada import (
+    derive_scada,
+    render_scada_for_chat,
+    SUPPORTED_VERSIONS,
+    SUPPORTED_PROTOCOLS,
+)
 
 
 # ---------------- OpenAI 工具描述 ----------------
@@ -141,6 +147,47 @@ TOOL_SPECS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_scada",
+            "description": (
+                "生成 MCGS 组态素材（变量字典/设备通道CSV/画面设计书/McgsScript脚本/协议说明）。"
+                "两种模式：① 联动模式 — 传 template_key 从已生成 PLC 程序派生变量；"
+                "② 独立模式 — 传 craft_desc 按工艺描述派生典型 I/O。"
+                "两种模式二选一：template_key 优先。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "template_key": {
+                        "type": "string",
+                        "description": "联动模式：PLC 程序模板 key（如 motor_latch），从其 io_table 派生 MCGS 变量",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "联动模式：模板参数键值对，留空用默认",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "craft_desc": {
+                        "type": "string",
+                        "description": "独立模式：工艺描述文本，如「电机启停控制，带故障指示」",
+                    },
+                    "mcgs_version": {
+                        "type": "string",
+                        "enum": SUPPORTED_VERSIONS,
+                        "description": "MCGS 版本，默认嵌入版",
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "enum": sorted({p for ps in SUPPORTED_PROTOCOLS.values() for p in ps}),
+                        "description": "通信协议，默认 PPI",
+                    },
+                    "name": {"type": "string", "description": "组态工程名（可选）"},
+                },
+            },
+        },
+    },
 ]
 
 
@@ -157,6 +204,7 @@ class ToolExecutor:
         self.confirm_write = None          # (address, value) -> bool
         self.on_connection_changed = None  # () -> None
         self.on_program_generated = None   # (program_dict) -> None
+        self.on_scada_generated = None     # (scada_dict) -> None
 
     # ---------- 状态 ----------
     @property
@@ -289,6 +337,47 @@ class ToolExecutor:
             )
         return text
 
+    # ---------- MCGS 组态 ----------
+    def generate_scada(self, template_key=None, params=None, craft_desc=None,
+                       mcgs_version="嵌入版", protocol="PPI", name=None) -> str:
+        """生成 MCGS 组态素材。
+
+        联动模式（template_key）：先调 get_template+render 得 program，再 derive_scada(program=...)
+        独立模式（craft_desc）：直接 derive_scada(craft_desc=...)
+        回调 on_scada_generated(scada)；返回 render_scada_for_chat(scada)。
+        """
+        try:
+            program = None
+            if template_key:
+                template = get_template(template_key)
+                program = render(template, params or {})
+                # 联动模式下，若也产生 PLC 程序，触发一次 program 回调让程序面板同步
+                if self.on_program_generated:
+                    self.on_program_generated(program)
+
+            if program is not None:
+                scada = derive_scada(
+                    program=program,
+                    mcgs_version=mcgs_version,
+                    protocol=protocol,
+                    name=name,
+                )
+            else:
+                if not craft_desc:
+                    return "请提供 template_key（联动模式）或 craft_desc（独立模式）之一。"
+                scada = derive_scada(
+                    craft_desc=craft_desc,
+                    mcgs_version=mcgs_version,
+                    protocol=protocol,
+                    name=name,
+                )
+        except Exception as e:
+            return f"MCGS 组态生成失败：{e}"
+
+        if self.on_scada_generated:
+            self.on_scada_generated(scada)
+        return render_scada_for_chat(scada)
+
     # ---------- 总入口 ----------
     def dispatch(self, name: str, arguments: str) -> str:
         try:
@@ -304,6 +393,7 @@ class ToolExecutor:
             "plc_status": self.plc_status,
             "list_templates": self.list_templates,
             "generate_program": self.generate_program,
+            "generate_scada": self.generate_scada,
         }.get(name)
         if handler is None:
             return f"未知工具：{name}"

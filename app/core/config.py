@@ -34,6 +34,11 @@ DEFAULT_CONFIG = {
     },
     # learning = 学习模式（引导/提示）；engineering = 工程模式（直接给完整程序）
     "mode": "engineering",
+    # MCGS 组态助手默认配置
+    "mcgs": {
+        "version": "McgsPro",  # McgsPro / 嵌入版 / 通用版
+        "protocol": "PPI",     # PPI / Modbus / OPC
+    },
 }
 
 _CLOUD_PRESETS = {

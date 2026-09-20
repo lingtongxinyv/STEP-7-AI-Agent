@@ -16,6 +16,7 @@ runtime/
 config.json
 startup.log
 fault.log
+app.log
 
 # ---- 编辑器/系统 ----
 .vscode/
