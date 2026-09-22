@@ -15,10 +15,20 @@ Agent 对话核心。
 from openai import OpenAI
 
 from .prompts import build_system_prompt
+from .probe import infer_roles
 from .tools import TOOL_SPECS, ToolExecutor
 from app.programs.templates import program_from_answer
 
 _MAX_TOOL_ROUNDS = 8
+
+# 任务分类关键词：命中任一 → 编程主力；否则 → 快速应答
+_TASK_CODING_HINTS = (
+    "程序", "编程", "梯形图", "模板", "生成", "写一", "设计", "STL", "SCL", "代码",
+    "启保停", "正反转", "星三角", "交通灯", "传送带", "皮带", "小车", "闪烁", "互锁",
+    "工艺", "组态", "MCGS", "导出", "AWL", "联锁", "控制逻辑", "画图", "流程",
+)
+# 涉及真实 PLC 数据的任务必须经支持工具调用的模型处理
+_TASK_TOOL_HINTS = ("读取", "写入", "连接", "状态", "当前值", "扫描", "变量", "监控", "PLC")
 
 
 class Assistant:
@@ -33,8 +43,27 @@ class Assistant:
     def reset(self):
         self.transcript = []
 
-    def _build_client(self):
+    def _build_client(self, entry=None):
+        """构建 OpenAI 客户端。
+
+        entry=None：旧单模型逻辑（llm.provider/ollama/cloud）；
+        entry=模型条目：按该条目的 provider/base_url/model/api_key 构建。
+        """
         llm = self.config["llm"]
+        if entry is not None:
+            provider = entry.get("provider", "ollama")
+            base_url = entry.get("base_url", "").strip()
+            api_key = entry.get("api_key", "").strip()
+            if not base_url:
+                # 未填地址时回退到旧配置中同 provider 的地址
+                src = llm.get(provider)
+                base_url = src.get("base_url", "") if isinstance(src, dict) else ""
+            if provider == "cloud" and not api_key:
+                raise RuntimeError(f"模型 {entry.get('model')} 未配置 API Key，请在设置中填写。")
+            if not base_url:
+                raise RuntimeError(f"模型 {entry.get('model')} 未配置接口地址，请在设置中填写。")
+            return OpenAI(base_url=base_url, api_key=api_key or "ollama",
+                          timeout=llm.get("timeout", 120)), entry.get("model", "")
         if llm["provider"] == "cloud":
             c = llm["cloud"]
             base_url, model, api_key = c["base_url"], c["model"], c.get("api_key", "")
@@ -45,22 +74,57 @@ class Assistant:
             base_url, model, api_key = o["base_url"], o["model"], "ollama"
         return OpenAI(base_url=base_url, api_key=api_key, timeout=llm.get("timeout", 120)), model
 
+    def _pick_model(self, user_text: str):
+        """多模型智能路由：按任务特征选择本轮模型。
+
+        返回 (模型条目|None, 路由原因)。None 表示不路由（单模型/开关关闭/无法区分强弱），
+        使用旧单模型逻辑。
+        """
+        llm = self.config.get("llm", {})
+        if not llm.get("routing"):
+            return None, ""
+        models = [m for m in llm.get("models", []) if m.get("model")]
+        if len(models) < 2:
+            return None, ""
+        coding, fast = infer_roles(models)
+        if coding is None or fast is None or coding is fast:
+            # 无可区分的强弱模型时，退回延迟最低的可用模型，避免路由形同虚设
+            usable = [m for m in models if m.get("ok")]
+            if len(usable) < 2:
+                return None, ""
+            best = min(usable, key=lambda m: m.get("latency_ms", 0))
+            return best, "按响应速度自动分配"
+
+        text = user_text or ""
+        if any(h in text for h in _TASK_CODING_HINTS) or len(text) > 60:
+            return coding, f"编程/设计任务 → {coding.get('model')}"
+        if any(h in text for h in _TASK_TOOL_HINTS) and not fast.get("tool_support", False):
+            # 快模型不支持工具调用时，涉及真实数据的任务交给主力模型
+            return coding, f"需调用工具 → {coding.get('model')}"
+        return fast, f"简单问答/查询 → {fast.get('model')}"
+
     def chat(self, user_text: str, event):
         self.transcript.append({"role": "user", "content": user_text})
+
+        entry, reason = self._pick_model(user_text)
         try:
-            client, model = self._build_client()
+            client, model = self._build_client(entry)
         except RuntimeError as e:
             event("error", str(e))
             return
+        if entry is not None:
+            event("status", reason or f"本轮由 {model} 处理")
 
         system_message = {
             "role": "system",
             "content": build_system_prompt(
                 self.config.get("mode", "engineering"),
                 self.executor.device_context(),
+                self.executor.io_library_text(),
             ),
         }
 
+        retried = False  # 路由模型请求失败时，允许回退一次
         for _round in range(_MAX_TOOL_ROUNDS):
             try:
                 stream = client.chat.completions.create(
@@ -72,6 +136,20 @@ class Assistant:
                     stream=True,
                 )
             except Exception as e:
+                others = [
+                    m for m in self.config["llm"].get("models", [])
+                    if m.get("model") and m is not entry
+                ] if entry is not None and not retried else []
+                if others:
+                    retried = True
+                    entry = others[0]
+                    try:
+                        client, model = self._build_client(entry)
+                    except RuntimeError:
+                        event("error", self._friendly_error(e))
+                        return
+                    event("status", f"请求失败，已回退到 {model} 重试……")
+                    continue
                 event("error", self._friendly_error(e))
                 return
 

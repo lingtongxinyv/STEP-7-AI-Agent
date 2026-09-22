@@ -16,8 +16,19 @@ _ENGINEERING_BLOCK = """\
 """
 
 
-def build_system_prompt(mode: str, device_context: str) -> str:
+def build_system_prompt(mode: str, device_context: str, io_library: str = "") -> str:
     mode_block = _LEARNING_BLOCK if mode == "learning" else _ENGINEERING_BLOCK
+    library_block = ""
+    if io_library:
+        library_block = f"""
+
+用户 I/O 地址库（用户已预设的元件地址，生成程序/组态时必须优先采用）：
+{io_library}
+- 自行编写非标程序、McgsScript 脚本或工艺描述时，凡地址库中已定义的元件，必须直接使用库中
+  地址，严禁另行分配或改写；
+- 地址库未覆盖的元件，先向用户确认地址再使用，不要凭空编造；
+- 模板默认 I/O 分配与地址库冲突时，按工具返回的提示向用户说明差异。\
+"""
     return f"""\
 你是“STEP 7 AI 助手”：一位资深西门子 PLC 工程师，同时也是耐心的老师，服务于中文用户。
 你熟悉 S7-200 SMART、S7-200、S7-300/400、S7-1200/1500 的指令系统、STEP 7-Micro/WIN SMART
@@ -27,7 +38,7 @@ def build_system_prompt(mode: str, device_context: str) -> str:
 
 当前设备上下文：
 {device_context}
-
+{library_block}
 必须遵守的规则：
 1. 凡涉及 PLC 的真实数据（当前值、运行状态、产量、温度等），必须调用相应工具获取，严禁凭想象编造数据。
 2. 常见控制任务（电机启保停、正反转、星三角、交通灯、传送带计数、闪烁、双皮带连锁、往返小车）

@@ -10,6 +10,8 @@ PLC 地址解析。
 支持标准 S7 风格（S7-300/400/1200/1500）：
     M0.0  I0.0  Q0.0
     DB1.DBX0.0  DB1.DBB1  DB1.DBW2  DB1.DBD4
+    T37 / C1                    定时器/计数器当前值 (INT, TM/CT 区)
+TIA 风格可加 % 前缀：%I0.0、%DB1.DBW2
 可附加显式类型：VD100:dint、MD20:dword
 """
 import re
@@ -63,6 +65,8 @@ def parse_address(text: str) -> ParsedAddress:
     if not text or not isinstance(text, str):
         raise AddressError("地址为空")
     raw = text.strip().replace(" ", "").upper()
+    if raw.startswith("%"):  # TIA 风格 %I0.0 / %DB1.DBW2
+        raw = raw[1:]
     if not raw:
         raise AddressError("地址为空")
 
@@ -135,6 +139,14 @@ def parse_address(text: str) -> ParsedAddress:
             return ParsedAddress(Areas.DB, 1, offset, dtype)
         return ParsedAddress(_PREFIX_AREA[prefix], 0, offset, dtype)
 
+    # 4) 计时器 / 计数器当前值：T37 / C1（S7-300/400/1200 的 TM/CT 区，INT）
+    m = re.fullmatch(r"([TC])(\d+)", raw)
+    if m:
+        area = Areas.TM if m.group(1) == "T" else Areas.CT
+        offset = int(m.group(2))
+        return ParsedAddress(area, 0, offset, explicit or "INT")
+
     raise AddressError(
-        f"无法识别的地址：{text}。示例：I0.0、Q0.1、M0.0、VB100、VW100、VD100、DB1.DBW2"
+        f"无法识别的地址：{text}。示例：I0.0、Q0.1、M0.0、VB100、VW100、VD100、"
+        f"DB1.DBW2、T37（定时器当前值）、C1（计数器当前值）"
     )

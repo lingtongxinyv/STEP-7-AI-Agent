@@ -2,9 +2,10 @@
 """
 STEP 7 AI Agent 主窗口。
 
-左侧：对话区（Markdown 渲染，支持流式输出）
+左侧：对话区（Markdown 渲染，气泡式消息，支持流式输出）
 右侧：PLC 面板（模拟/真机连接、变量监控、安全门禁）+ 程序面板（代码/IO表/导出）
 """
+import re
 import threading
 
 from PySide6.QtCore import (
@@ -13,13 +14,15 @@ from PySide6.QtCore import (
     QThread,
     QTimer,
     QObject,
+    QMetaObject,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QGuiApplication, QTextCursor, QTextCharFormat, QColor
+from PySide6.QtGui import QGuiApplication, QTextCursor, QTextCharFormat, QColor, QTextDocument
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -33,7 +36,6 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -50,8 +52,17 @@ from app.agent.assistant import Assistant
 from app.agent.tools import ToolExecutor
 from app.core.config import base_dir, cloud_presets, load_config, save_config
 from app.programs.ladder import LadderWidget, build_ladder, export_awl_text
+from app.plc.address import parse_address
 from app.plc.profiles import get_profile, profile_names
-from app.ui.workers import ChatWorker, ConnTestWorker
+from app.scada import SUPPORTED_PROTOCOLS
+from app.ui.workers import (
+    ChatWorker,
+    ConnTestWorker,
+    PollWorker,
+    ActionWorker,
+    McgsDetectWorker,
+    ModelProbeWorker,
+)
 
 
 # ---------------- 写操作跨线程确认 ----------------
@@ -89,6 +100,18 @@ class ConfirmBridge(QObject):
 
 
 # ---------------- 对话面板 ----------------
+
+def _md_to_fragment(text: str) -> str:
+    """把一段 Markdown 转成可嵌入气泡的 HTML 片段。"""
+    doc = QTextDocument()
+    doc.setMarkdown(text or "……")
+    html = doc.toHtml()
+    m = re.search(r"<body[^>]*>(.*)</body>", html, re.S | re.I)
+    frag = m.group(1) if m else html
+    # QTextDocument 会输出空的 <p class="title">，去掉以免占高
+    frag = re.sub(r'<p class="title"></p>', "", frag)
+    return frag
+
 
 class ChatPanel(QWidget):
     def __init__(self):
@@ -158,17 +181,58 @@ class ChatPanel(QWidget):
         self.input_box.clear()
 
     def _rebuild(self):
-        parts = []
+        bubbles = []
         for role, text in self._messages:
-            title = "**🧑 我：**" if role == "user" else "**🤖 STEP 7 AI 助手：**"
-            parts.append(f"{title}\n\n{text if text else '……'}")
-        self.view.setMarkdown("\n\n---\n\n".join(parts))
+            frag = _md_to_fragment(text)
+            if role == "user":
+                caption = (
+                    '<div style="color:#6b7280;font-size:11px;margin:6px 4px 1px 0;">我</div>'
+                )
+                bubble = (
+                    '<table width="100%" cellpadding="0" cellspacing="2">'
+                    '<tr><td align="right">'
+                    + caption +
+                    '</td></tr><tr><td align="right">'
+                    '<table cellspacing="0" style="background:#2563eb;color:white;">'
+                    f'<tr><td style="color:white;padding:8px 12px;">{frag}</td></tr></table>'
+                    '</td></tr></table>'
+                )
+            else:
+                caption = (
+                    '<div style="color:#6b7280;font-size:11px;margin:6px 0 1px 4px;">'
+                    'STEP 7 AI 助手</div>'
+                )
+                bubble = (
+                    '<table width="100%" cellpadding="0" cellspacing="2">'
+                    '<tr><td align="left">'
+                    + caption +
+                    '</td></tr><tr><td align="left">'
+                    '<table cellspacing="0" style="background:white;border:1px solid #e3e8f0;">'
+                    f'<tr><td style="padding:8px 12px;">{frag}</td></tr></table>'
+                    '</td></tr></table>'
+                )
+            bubbles.append(bubble)
+        html = (
+            '<html><head><style>'
+            'body{background:#f4f6fb;}'
+            'p{margin:3px 0;}'
+            'code{background:#eef2ff;font-family:Consolas,monospace;padding:0 2px;}'
+            'pre{background:#f1f5f9;padding:6px;border-radius:6px;}'
+            'table{margin:0;}'
+            'li{margin:2px 0;}'
+            '</style></head><body>'
+            + "".join(bubbles)
+            + '</body></html>'
+        )
+        self.view.setHtml(html)
         self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
 
 
 # ---------------- PLC 面板 ----------------
 
 class PlcPanel(QWidget):
+    tags_changed = Signal()
+
     def __init__(self, executor: ToolExecutor):
         super().__init__()
         self.executor = executor
@@ -243,10 +307,6 @@ class PlcPanel(QWidget):
         root.addWidget(safe_box)
         root.addWidget(watch_box, 1)
 
-        # 定时器自动刷新
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(1000)
-
         self._fill_profile_defaults()
 
     # ---- 默认值 ----
@@ -283,35 +343,48 @@ class PlcPanel(QWidget):
             "停止模拟PLC" if self.executor.mock.running else "启动模拟PLC"
         )
 
-    def refresh_values(self):
-        if not self.executor.connected:
-            for row in range(self.tbl_tags.rowCount()):
-                self.tbl_tags.item(row, 1).setText("—")
-            return
+    def mark_all(self, text: str = "—"):
+        """断开连接时把所有当前值重置为占位符。"""
         for row in range(self.tbl_tags.rowCount()):
-            addr = self.tbl_tags.item(row, 0).text()
-            try:
-                value = self.executor.driver.read(addr)
-                self.tbl_tags.item(row, 1).setText(str(value))
-            except Exception as e:
-                self.tbl_tags.item(row, 1).setText(f"错误")
+            self.tbl_tags.item(row, 1).setText(text)
+
+    @Slot(object)
+    def apply_values(self, results):
+        """后台轮询结果回到 GUI 线程后刷新表格。"""
+        for row, text in results:
+            if 0 <= row < self.tbl_tags.rowCount():
+                self.tbl_tags.item(row, 1).setText(text)
+
+    def watch_addresses(self):
+        """供轮询线程使用：[(行号, 地址), ...]"""
+        return [
+            (row, self.tbl_tags.item(row, 0).text())
+            for row in range(self.tbl_tags.rowCount())
+        ]
 
     # ---- 监控表操作 ----
     def add_tag(self, address: str = ""):
         address = address or self.edt_new_tag.text().strip()
         if not address:
             return
+        try:
+            parse_address(address)
+        except ValueError as e:
+            QMessageBox.warning(self, "地址无效", f"无法识别的地址：{address}\n\n{e}")
+            return
         row = self.tbl_tags.rowCount()
         self.tbl_tags.insertRow(row)
         self.tbl_tags.setItem(row, 0, QTableWidgetItem(address))
         self.tbl_tags.setItem(row, 1, QTableWidgetItem("—"))
         self.edt_new_tag.clear()
-        self.refresh_values()
+        self.tags_changed.emit()
 
     def remove_selected(self):
         rows = sorted({i.row() for i in self.tbl_tags.selectedIndexes()}, reverse=True)
         for row in rows:
             self.tbl_tags.removeRow(row)
+        if rows:
+            self.tags_changed.emit()
 
     def selected_address(self):
         rows = {i.row() for i in self.tbl_tags.selectedIndexes()}
@@ -472,21 +545,24 @@ class ScadaPanel(QWidget):
         self.config = config
 
         # ========== 顶部：MCGS 连接区 ==========
-        self.btn_connect_mcgs = QPushButton("🔌 连接 MCGS")
+        self.btn_connect_mcgs = QPushButton("🔌 重新检测")
         self.btn_connect_mcgs.setToolTip("自动检测本机 MCGS 安装位置（注册表→快捷方式→全盘搜索）")
         self.lbl_mcgs_status = QLabel("未检测到 MCGS")
         self.lbl_mcgs_status.setStyleSheet("color: #999;")
         self.btn_start_mcgs = QPushButton("▶ 启动 MCGS")
         self.btn_start_mcgs.setEnabled(False)
         self.btn_start_mcgs.setToolTip("启动已安装的 MCGS 组态软件")
+        self.btn_locate_mcgs = QPushButton("📂 手动定位")
+        self.btn_locate_mcgs.setToolTip("自动检测不到时，手动选择 MCGS 组态软件可执行文件")
         self.lbl_mcgs_path = QLabel("")
-        self.lbl_mcgs_path.setStyleSheet("color: #1a7f37;")
+        self.lbl_mcgs_path.setStyleSheet("color: #6b7280;")
         self.mcgs_exe_path = None
 
         conn_row = QHBoxLayout()
         conn_row.addWidget(self.btn_connect_mcgs)
         conn_row.addWidget(self.lbl_mcgs_status)
         conn_row.addWidget(self.btn_start_mcgs)
+        conn_row.addWidget(self.btn_locate_mcgs)
         conn_row.addWidget(self.lbl_mcgs_path, 1)
 
         # ========== 中部：生成控制条 ==========
@@ -496,18 +572,12 @@ class ScadaPanel(QWidget):
         self.cmb_protocol.addItems(["PPI", "Modbus", "OPC"])
         self.btn_generate = QPushButton("⚡ 生成组态素材")
         self.btn_generate.setToolTip("按当前版本/协议，用默认工艺描述生成组态素材")
-        self.btn_generate.setStyleSheet(
-            "QPushButton{background:#1a7f37;color:white;padding:6px 16px;font-weight:bold;}"
-            "QPushButton:hover{background:#15662b;}"
-        )
+        self.btn_generate.setProperty("variant", "success")
         self.btn_export = QPushButton("📦 导出包")
         self.btn_export.setToolTip("将当前素材导出为 7 个文件到指定目录")
         self.btn_auto_write = QPushButton("🔄 写入 MCGS")
         self.btn_auto_write.setToolTip("自动写入 MCGS（需先启动 MCGS，UI 自动化）")
-        self.btn_auto_write.setStyleSheet(
-            "QPushButton{background:#0969da;color:white;padding:6px 16px;font-weight:bold;}"
-            "QPushButton:hover{background:#0550ae;}"
-        )
+        self.btn_auto_write.setProperty("variant", "primary")
 
         ctrl_row = QHBoxLayout()
         ctrl_row.addWidget(QLabel("版本"))
@@ -627,14 +697,21 @@ class ScadaPanel(QWidget):
         layout.addWidget(self.material_tabs, 1)
 
         # ========== 信号 ==========
-        self.btn_connect_mcgs.clicked.connect(self._connect_mcgs)
+        self.btn_connect_mcgs.clicked.connect(self._detect_mcgs)
         self.btn_start_mcgs.clicked.connect(self._start_mcgs)
+        self.btn_locate_mcgs.clicked.connect(self._manual_locate_mcgs)
+        self.cmb_version.currentIndexChanged.connect(self._on_version_changed)
         self.btn_generate.clicked.connect(self._generate_now)
         self.btn_export.clicked.connect(self.export_package)
         self.btn_auto_write.clicked.connect(self._auto_write_to_mcgs)
 
-        # ========== 初始化版本/协议下拉 ==========
+        # 检测线程占位
+        self._detect_thread = None
+        self._detect_worker = None
+
+        # ========== 初始化版本/协议下拉（先按配置过滤协议，再恢复选择） ==========
         mcgs_cfg = config.get("mcgs", {})
+        self._on_version_changed()
         vi = self.cmb_version.findText(mcgs_cfg.get("version", "McgsPro"))
         if vi >= 0:
             self.cmb_version.setCurrentIndex(vi)
@@ -642,24 +719,40 @@ class ScadaPanel(QWidget):
         if pi >= 0:
             self.cmb_protocol.setCurrentIndex(pi)
 
-        # ========== 首次自动检测 MCGS ==========
-        self._connect_mcgs()
+        # ========== 首次自动检测 MCGS（后台，避免全盘搜索卡住启动） ==========
+        self._detect_mcgs()
 
-    # ---------- MCGS 连接按钮 ----------
-    def _connect_mcgs(self):
-        """分层检测本机 MCGS 安装路径（注册表 > 快捷方式 > 全盘搜索）。"""
-        from app.scada import find_mcgs_installed
+    # ---------- MCGS 后台检测 ----------
+    def _detect_mcgs(self):
+        """后台分层检测本机 MCGS 安装路径（注册表 > 快捷方式 > 全盘搜索）。"""
+        if self._detect_thread is not None:
+            return
         self.lbl_mcgs_status.setText("检测中……")
         self.lbl_mcgs_status.setStyleSheet("color: #999;")
         self.lbl_mcgs_path.setText("")
-        QGuiApplication.processEvents()
 
-        ver, path = find_mcgs_installed()
+        thread = QThread()
+        worker = McgsDetectWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.detected.connect(self._apply_detection)
+        thread.start()
+        self._detect_thread = thread
+        self._detect_worker = worker
+
+    def _apply_detection(self, ver: str, path: str):
+        """检测线程完成后回到 GUI 线程渲染结果。"""
+        thread, worker = self._detect_thread, self._detect_worker
+        self._detect_thread = self._detect_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            worker.deleteLater()
 
         if ver and path:
             self.mcgs_exe_path = path
             self.lbl_mcgs_status.setText(f"✓ {ver}")
-            self.lbl_mcgs_status.setStyleSheet("color: #1a7f37; font-weight: bold;")
+            self.lbl_mcgs_status.setStyleSheet("color: #16a34a; font-weight: bold;")
             self.lbl_mcgs_path.setText(f"📁 {path}")
             self.btn_start_mcgs.setEnabled(True)
             idx = self.cmb_version.findText(ver)
@@ -668,12 +761,24 @@ class ScadaPanel(QWidget):
         else:
             self.mcgs_exe_path = None
             self.lbl_mcgs_status.setText("✗ 未检测到")
-            self.lbl_mcgs_status.setStyleSheet("color: #c62828;")
+            self.lbl_mcgs_status.setStyleSheet("color: #dc2626;")
             self.lbl_mcgs_path.setText(
                 "已扫描注册表/快捷方式/全盘，未找到 MCGS。"
-                "请确认已安装，或手动选择版本后点生成。"
+                "可点「📂 手动定位」，或直接选择版本后点生成。"
             )
             self.btn_start_mcgs.setEnabled(False)
+
+    def _on_version_changed(self):
+        """版本变化时按支持矩阵过滤协议；嵌入版不支持 OPC。"""
+        version = self.cmb_version.currentText()
+        allowed = SUPPORTED_PROTOCOLS.get(version, ["PPI"])
+        cur = self.cmb_protocol.currentText()
+        self.cmb_protocol.blockSignals(True)
+        self.cmb_protocol.clear()
+        self.cmb_protocol.addItems(allowed)
+        if cur in allowed:
+            self.cmb_protocol.setCurrentText(cur)
+        self.cmb_protocol.blockSignals(False)
 
     def _manual_locate_mcgs(self):
         """用户通过文件对话框手动选择 MCGS exe 路径。"""
@@ -702,15 +807,16 @@ class ScadaPanel(QWidget):
         """启动 MCGS 组态软件（独立进程）。"""
         if not self.mcgs_exe_path:
             return
+        import os
         import subprocess
         try:
+            work_dir = os.path.dirname(self.mcgs_exe_path)
             subprocess.Popen(
                 [self.mcgs_exe_path],
-                cwd=self.mcgs_exe_path.rsplit("\\", 1)[0],
+                cwd=work_dir or None,
             )
-            self.lbl_mcgs_version.setText(
-                f"已启动 {self.lbl_mcgs_status.text().replace('已检测到 ', '')}，"
-                f"请在 MCGS 组态环境中打开/新建工程。"
+            self.lbl_mcgs_path.setText(
+                "▶ 已启动 MCGS，请在组态环境中打开/新建工程。"
             )
         except Exception as e:
             QMessageBox.warning(self, "启动失败", str(e))
@@ -922,8 +1028,98 @@ class ScadaPanel(QWidget):
         from PySide6.QtCore import QTimer
         QTimer.singleShot(3000, lambda: self._progress_container.setVisible(False))
 
+    def shutdown(self):
+        """主窗口关闭时回收检测线程与写入线程（尽力等待，不阻塞过久）。"""
+        if self._detect_thread is not None:
+            self._detect_thread.quit()
+            self._detect_thread.wait(2000)
+            if self._detect_worker is not None:
+                self._detect_worker.deleteLater()
+            self._detect_thread = None
+            self._detect_worker = None
+        write_worker = getattr(self, "_write_worker", None)
+        if write_worker is not None and write_worker.isRunning():
+            write_worker.wait(3000)
+
 
 # ---------------- 设置对话框 ----------------
+
+class ModelEditDialog(QDialog):
+    """单个模型条目的添加/编辑对话框。"""
+
+    def __init__(self, parent=None, entry: dict = None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑模型" if entry else "添加模型")
+        entry = entry or {}
+
+        self.cmb_provider = QComboBox()
+        self.cmb_provider.addItems(["ollama", "cloud"])
+        self.cmb_provider.setCurrentText(entry.get("provider", "ollama"))
+
+        self.cmb_preset = QComboBox()
+        self.cmb_preset.addItem("快捷预设", None)
+        for name, (url, model) in cloud_presets().items():
+            self.cmb_preset.addItem(name, (url, model))
+
+        self.edt_url = QLineEdit(entry.get("base_url", ""))
+        self.edt_model = QLineEdit(entry.get("model", ""))
+        self.edt_key = QLineEdit(entry.get("api_key", ""))
+        self.edt_key.setEchoMode(QLineEdit.EchoMode.Password)
+
+        form = QFormLayout()
+        form.addRow("类型：", self.cmb_provider)
+        form.addRow("快捷预设：", self.cmb_preset)
+        form.addRow("接口地址：", self.edt_url)
+        form.addRow("模型名称：", self.edt_model)
+        form.addRow("API Key：", self.edt_key)
+        hint = QLabel("cloud 类型需填写 API Key；ollama 类型 Key 留空即可。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7280;")
+
+        self.btn_ok = QPushButton("确定")
+        self.btn_ok.setProperty("variant", "primary")
+        self.btn_cancel = QPushButton("取消")
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(self.btn_ok)
+        btns.addWidget(self.btn_cancel)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(hint)
+        lay.addLayout(btns)
+        self.resize(430, 260)
+
+        self.cmb_provider.currentTextChanged.connect(self._on_provider)
+        self.cmb_preset.currentIndexChanged.connect(self._apply_preset)
+        self.btn_ok.clicked.connect(self._ok)
+        self.btn_cancel.clicked.connect(self.reject)
+        self._on_provider(self.cmb_provider.currentText())
+
+    def _on_provider(self, provider: str):
+        self.cmb_preset.setEnabled(provider == "cloud")
+
+    def _apply_preset(self):
+        data = self.cmb_preset.currentData()
+        if data:
+            self.edt_url.setText(data[0])
+            self.edt_model.setText(data[1])
+
+    def _ok(self):
+        if not self.edt_model.text().strip():
+            QMessageBox.warning(self, "缺少信息", "模型名称不能为空。")
+            return
+        self.accept()
+
+    def entry(self) -> dict:
+        provider = self.cmb_provider.currentText()
+        return {
+            "provider": provider,
+            "base_url": self.edt_url.text().strip(),
+            "model": self.edt_model.text().strip(),
+            "api_key": self.edt_key.text().strip() if provider == "cloud" else "",
+        }
+
 
 class SettingsDialog(QWidget):
     def __init__(self, config: dict):
@@ -931,38 +1127,57 @@ class SettingsDialog(QWidget):
         self.setWindowTitle("模型设置")
         self.config = config
         llm = config["llm"]
+        self._models = [dict(m) for m in llm.get("models", [])]  # 工作副本
 
-        self.rd_ollama = QRadioButton("本地 Ollama")
-        self.rd_cloud = QRadioButton("云端 OpenAI 兼容接口")
-        if llm["provider"] == "cloud":
-            self.rd_cloud.setChecked(True)
-        else:
-            self.rd_ollama.setChecked(True)
+        # ---- 多模型智能路由 ----
+        self.chk_routing = QCheckBox("启用多模型智能路由（≥2 个模型时按任务自动分配）")
+        self.chk_routing.setToolTip(
+            "开启后：编程/设计任务自动交给编程能力最强的模型（编程主力），\n"
+            "简单问答/查询交给响应最快的模型（快速应答）。\n"
+            "请先添加至少两个模型并点击「检测模型能力」。"
+        )
+        self.chk_routing.setChecked(bool(llm.get("routing")))
 
-        # Ollama
-        ollama_box = QGroupBox("Ollama 设置")
-        self.ollama_url = QLineEdit(llm["ollama"]["base_url"])
-        self.ollama_model = QLineEdit(llm["ollama"]["model"])
-        oform = QFormLayout(ollama_box)
-        oform.addRow("接口地址：", self.ollama_url)
-        oform.addRow("模型名称：", self.ollama_model)
+        models_box = QGroupBox("模型列表")
+        self.tbl_models = QTableWidget(0, 4)
+        self.tbl_models.setHorizontalHeaderLabels(["类型", "模型名称", "接口地址", "探测状态"])
+        self.tbl_models.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.tbl_models.verticalHeader().setDefaultSectionSize(28)
+        self.tbl_models.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl_models.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.tbl_models.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl_models.doubleClicked.connect(self._edit_model)
 
-        # 云端
-        cloud_box = QGroupBox("云端设置")
-        self.cmb_preset = QComboBox()
-        self.cmb_preset.addItem("自定义")
-        self.cmb_preset.addItems(list(cloud_presets().keys()))
-        self.cloud_url = QLineEdit(llm["cloud"]["base_url"])
-        self.cloud_model = QLineEdit(llm["cloud"]["model"])
-        self.cloud_key = QLineEdit(llm["cloud"].get("api_key", ""))
-        self.cloud_key.setEchoMode(QLineEdit.EchoMode.Password)
-        cform = QFormLayout(cloud_box)
-        cform.addRow("快捷预设：", self.cmb_preset)
-        cform.addRow("接口地址：", self.cloud_url)
-        cform.addRow("模型名称：", self.cloud_model)
-        cform.addRow("API Key：", self.cloud_key)
+        self.btn_add = QPushButton("添加")
+        self.btn_edit = QPushButton("编辑")
+        self.btn_del = QPushButton("删除")
+        self.btn_probe = QPushButton("检测模型能力")
+        self.btn_probe.setProperty("variant", "primary")
+        self.btn_probe.setToolTip(
+            "逐个测试连通性、首字延迟、工具调用支持与编程能力；\n"
+            "探测结果作为智能路由的角色分配依据。"
+        )
 
-        # 其他
+        mcol = QVBoxLayout()
+        mcol.addWidget(self.btn_add)
+        mcol.addWidget(self.btn_edit)
+        mcol.addWidget(self.btn_del)
+        mcol.addSpacing(8)
+        mcol.addWidget(self.btn_probe)
+        mcol.addStretch(1)
+        mrow = QHBoxLayout()
+        mrow.addWidget(self.tbl_models, 1)
+        mrow.addLayout(mcol)
+        mform = QVBoxLayout(models_box)
+        mform.addLayout(mrow)
+        self.lbl_probe_hint = QLabel(
+            "双击行可编辑；保存前请点「检测模型能力」，否则路由无法区分模型强弱。"
+        )
+        self.lbl_probe_hint.setWordWrap(True)
+        self.lbl_probe_hint.setStyleSheet("color: #6b7280;")
+        mform.addWidget(self.lbl_probe_hint)
+
+        # ---- 生成参数 ----
         other_box = QGroupBox("生成参数")
         self.spn_temp = QDoubleSpinBox()
         self.spn_temp.setRange(0.0, 1.0)
@@ -975,11 +1190,9 @@ class SettingsDialog(QWidget):
         eform.addRow("温度：", self.spn_temp)
         eform.addRow("超时(秒)：", self.spn_timeout)
 
-        self.btn_save = QPushButton("保存")
-        self.btn_cancel = QPushButton("取消")
-
-        # 连通性测试（使用对话框当前填写值，无需先保存）
+        # ---- 连通性测试 ----
         self.btn_test = QPushButton("测试连通性")
+        self.btn_test.setToolTip("测试选中的模型；未选中时测试默认配置")
         self.lbl_test_result = QLabel("")
         self.lbl_test_result.setWordWrap(True)
         self.lbl_test_result.setStyleSheet("color: #555;")
@@ -989,37 +1202,138 @@ class SettingsDialog(QWidget):
 
         btns = QHBoxLayout()
         btns.addStretch(1)
+        self.btn_save = QPushButton("保存")
+        self.btn_save.setProperty("variant", "primary")
+        self.btn_cancel = QPushButton("取消")
         btns.addWidget(self.btn_save)
         btns.addWidget(self.btn_cancel)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.rd_ollama)
-        layout.addWidget(ollama_box)
-        layout.addWidget(self.rd_cloud)
-        layout.addWidget(cloud_box)
+        layout.addWidget(self.chk_routing)
+        layout.addWidget(models_box, 1)
         layout.addWidget(other_box)
         layout.addLayout(test_row)
         layout.addLayout(btns)
-        self.resize(520, 660)
+        self.resize(660, 640)
 
         self._test_thread = None
         self._test_worker = None
+        self._probe_thread = None
+        self._probe_worker = None
+
+        self._fill_models()
+        self.btn_add.clicked.connect(self._add_model)
+        self.btn_edit.clicked.connect(self._edit_model)
+        self.btn_del.clicked.connect(self._del_model)
+        self.btn_probe.clicked.connect(self._probe_models)
         self.btn_test.clicked.connect(self.test_now)
 
-    def _collect_llm(self) -> dict:
-        """收集对话框当前填写的 llm 配置（测试无需先保存）。"""
-        return {
-            "provider": "cloud" if self.rd_cloud.isChecked() else "ollama",
-            "ollama": {
-                "base_url": self.ollama_url.text().strip(),
-                "model": self.ollama_model.text().strip(),
-            },
-            "cloud": {
-                "base_url": self.cloud_url.text().strip(),
-                "model": self.cloud_model.text().strip(),
-                "api_key": self.cloud_key.text().strip(),
-            },
-        }
+    # ---------- 模型列表 ----------
+    def _fill_models(self):
+        self.tbl_models.setRowCount(0)
+        for m in self._models:
+            row = self.tbl_models.rowCount()
+            self.tbl_models.insertRow(row)
+            self.tbl_models.setItem(row, 0, QTableWidgetItem(m.get("provider", "")))
+            self.tbl_models.setItem(row, 1, QTableWidgetItem(m.get("model", "")))
+            self.tbl_models.setItem(row, 2, QTableWidgetItem(m.get("base_url", "")))
+            self.tbl_models.setItem(row, 3, QTableWidgetItem(self._status_text(m)))
+
+    @staticmethod
+    def _status_text(m: dict) -> str:
+        if not m.get("ok"):
+            msg = m.get("message", "")
+            return f"✗ {msg}" if msg else "未探测"
+        tools = "支持工具" if m.get("tool_support") else "无工具"
+        return f"✓ {m.get('latency_ms', 0)}ms · {tools} · 编程{m.get('coding_score', 0)}分"
+
+    def _add_model(self):
+        dlg = ModelEditDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._models.append(dlg.entry())
+            self._fill_models()
+
+    def _edit_model(self, *_):
+        row = self.tbl_models.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "提示", "请先选中一个模型（双击行也可编辑）。")
+            return
+        dlg = ModelEditDialog(self, self._models[row])
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._models[row] = dlg.entry()
+            self._fill_models()
+
+    def _del_model(self):
+        row = self.tbl_models.currentRow()
+        if row < 0:
+            return
+        self._models.pop(row)
+        self._fill_models()
+
+    # ---------- 能力探测 ----------
+    def _probe_models(self):
+        if self._probe_thread is not None:
+            return
+        if not self._models:
+            QMessageBox.information(self, "提示", "请先添加模型。")
+            return
+        self.btn_probe.setEnabled(False)
+        self.lbl_probe_hint.setText(
+            f"正在探测 {len(self._models)} 个模型（每个需数秒到一分钟），请稍候……"
+        )
+        thread = QThread()
+        worker = ModelProbeWorker(
+            list(enumerate(self._models)), int(self.spn_timeout.value())
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_probe_progress)
+        worker.probed.connect(self._on_probe_result)
+        worker.finished_all.connect(self._on_probe_done)
+        thread.start()
+        self._probe_thread = thread
+        self._probe_worker = worker
+
+    def _on_probe_progress(self, _idx: int, text: str):
+        self.lbl_probe_hint.setText(text)
+
+    def _on_probe_result(self, idx: int, result: dict):
+        if 0 <= idx < len(self._models):
+            m = self._models[idx]
+            for key in ("ok", "latency_ms", "tool_support", "coding_score"):
+                m[key] = result.get(key)
+            m["message"] = "" if result.get("ok") else result.get("message", "探测失败")
+            self.tbl_models.item(idx, 3).setText(self._status_text(m))
+
+    def _on_probe_done(self):
+        self.lbl_probe_hint.setText(
+            "探测完成：编程得分最高者担任「编程主力」，首字延迟最低者担任「快速应答」。"
+        )
+        self.btn_probe.setEnabled(True)
+        if self._probe_thread is not None:
+            self._probe_thread.quit()
+            self._probe_thread.wait()
+            self._probe_worker.deleteLater()
+            self._probe_thread = None
+            self._probe_worker = None
+
+    # ---------- 连通性测试 ----------
+    def _selected_llm_config(self) -> dict:
+        """构造 test_connection 所需的旧格式 llm 配置。"""
+        row = self.tbl_models.currentRow()
+        if 0 <= row < len(self._models):
+            m = self._models[row]
+            return {
+                "provider": m.get("provider", "ollama"),
+                "ollama": {"base_url": m.get("base_url", ""), "model": m.get("model", "")},
+                "cloud": {
+                    "base_url": m.get("base_url", ""),
+                    "model": m.get("model", ""),
+                    "api_key": m.get("api_key", ""),
+                },
+            }
+        llm = self.config["llm"]
+        return {"provider": llm["provider"], "ollama": dict(llm["ollama"]), "cloud": dict(llm["cloud"])}
 
     def test_now(self):
         if self._test_thread is not None:
@@ -1029,7 +1343,7 @@ class SettingsDialog(QWidget):
         self.lbl_test_result.setText("正在测试（连通 → 模型 → 推理），请稍候……")
 
         thread = QThread()
-        worker = ConnTestWorker(self._collect_llm())
+        worker = ConnTestWorker(self._selected_llm_config())
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.done.connect(self._show_test_result)
@@ -1051,34 +1365,151 @@ class SettingsDialog(QWidget):
             self._test_worker = None
 
     def closeEvent(self, event):
-        # 关闭对话框时回收测试线程，避免悬挂
-        if self._test_thread is not None:
-            self._test_thread.quit()
-            self._test_thread.wait(3000)
-            if self._test_worker is not None:
-                self._test_worker.deleteLater()
-            self._test_thread = None
+        # 关闭对话框时回收测试/探测线程，避免悬挂
+        for t_attr, w_attr in (("_test_thread", "_test_worker"),
+                               ("_probe_thread", "_probe_worker")):
+            thread = getattr(self, t_attr)
+            if thread is not None:
+                thread.quit()
+                thread.wait(3000)
+                worker = getattr(self, w_attr)
+                if worker is not None:
+                    worker.deleteLater()
+                setattr(self, t_attr, None)
+                setattr(self, w_attr, None)
         super().closeEvent(event)
-
-    def apply_preset(self):
-        name = self.cmb_preset.currentText()
-        presets = cloud_presets()
-        if name in presets:
-            url, model = presets[name]
-            self.cloud_url.setText(url)
-            self.cloud_model.setText(model)
 
     def result_config(self) -> dict:
         cfg = self.config
-        cfg["llm"]["provider"] = "cloud" if self.rd_cloud.isChecked() else "ollama"
-        cfg["llm"]["ollama"]["base_url"] = self.ollama_url.text().strip()
-        cfg["llm"]["ollama"]["model"] = self.ollama_model.text().strip()
-        cfg["llm"]["cloud"]["base_url"] = self.cloud_url.text().strip()
-        cfg["llm"]["cloud"]["model"] = self.cloud_model.text().strip()
-        cfg["llm"]["cloud"]["api_key"] = self.cloud_key.text().strip()
-        cfg["llm"]["temperature"] = self.spn_temp.value()
-        cfg["llm"]["timeout"] = self.spn_timeout.value()
+        llm = cfg["llm"]
+        llm["routing"] = self.chk_routing.isChecked()
+        llm["models"] = [dict(m) for m in self._models]
+        llm["temperature"] = self.spn_temp.value()
+        llm["timeout"] = self.spn_timeout.value()
+        # 同步首个模型到旧单模型字段，保持默认配置与回退链路有效
+        if llm["models"]:
+            first = llm["models"][0]
+            provider = first.get("provider", "ollama")
+            llm["provider"] = provider
+            patch = {"base_url": first.get("base_url", ""), "model": first.get("model", "")}
+            if provider == "cloud":
+                patch["api_key"] = first.get("api_key", "")
+            llm[provider].update(patch)
         return cfg
+
+
+# ---------------- I/O 地址库对话框 ----------------
+
+class IOLibraryDialog(QWidget):
+    """I/O 地址库编辑器：用户预设元件地址，AI 生成程序/组态时直接采用。"""
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.setWindowTitle("I/O 地址库")
+        self.config = config
+
+        self.tbl = QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["元件/符号", "地址", "备注"])
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl.verticalHeader().setDefaultSectionSize(30)
+
+        hint = QLabel(
+            "预设元件地址后，AI 生成非标程序、脚本与组态时将直接采用这些地址。\n"
+            "地址格式：I0.0 / Q0.1 / M2.3 / VW100 / VD200 / T37 / C1 等。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7280;")
+
+        self.btn_add = QPushButton("添加")
+        self.btn_remove = QPushButton("删除选中")
+        self.btn_clear = QPushButton("清空")
+        self.btn_save = QPushButton("保存")
+        self.btn_save.setProperty("variant", "primary")
+        self.btn_close = QPushButton("关闭")
+
+        btn_col = QVBoxLayout()
+        btn_col.addWidget(self.btn_add)
+        btn_col.addWidget(self.btn_remove)
+        btn_col.addWidget(self.btn_clear)
+        btn_col.addStretch(1)
+
+        left = QHBoxLayout()
+        left.addWidget(self.tbl, 1)
+        left.addLayout(btn_col)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(self.btn_save)
+        btns.addWidget(self.btn_close)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(hint)
+        lay.addLayout(left, 1)
+        lay.addLayout(btns)
+        self.resize(560, 480)
+
+        self._load()
+        self.btn_add.clicked.connect(self._add_row)
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_clear.clicked.connect(lambda: self.tbl.setRowCount(0))
+        self.btn_save.clicked.connect(self._save)
+        self.btn_close.clicked.connect(self.close)
+
+    def _load(self):
+        for e in self.config.get("io_library", []):
+            self._add_row(e.get("symbol", ""), e.get("address", ""), e.get("comment", ""))
+
+    def _add_row(self, symbol: str = "", address: str = "", comment: str = ""):
+        row = self.tbl.rowCount()
+        self.tbl.insertRow(row)
+        self.tbl.setItem(row, 0, QTableWidgetItem(symbol))
+        self.tbl.setItem(row, 1, QTableWidgetItem(address))
+        self.tbl.setItem(row, 2, QTableWidgetItem(comment))
+        self.tbl.setCurrentCell(row, 0)
+
+    def _remove_selected(self):
+        rows = sorted({i.row() for i in self.tbl.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.tbl.removeRow(r)
+
+    def _collect(self):
+        rows = []
+        for row in range(self.tbl.rowCount()):
+            def cell(c):
+                it = self.tbl.item(row, c)
+                return it.text().strip() if it is not None else ""
+            symbol, address, comment = cell(0), cell(1), cell(2)
+            if symbol or address or comment:
+                rows.append((row + 1, symbol, address.upper(), comment))
+        return rows
+
+    def _save(self):
+        rows = self._collect()
+        for lineno, symbol, address, _c in rows:
+            if not symbol or not address:
+                QMessageBox.warning(
+                    self, "保存失败", f"第 {lineno} 行：元件名称与地址都必须填写。"
+                )
+                return
+            try:
+                parse_address(address)
+            except ValueError as e:
+                QMessageBox.warning(
+                    self, "地址无效",
+                    f"第 {lineno} 行：元件「{symbol}」的地址 {address} 无法识别。\n\n{e}",
+                )
+                return
+        self.config["io_library"] = [
+            {"symbol": s, "address": a, "comment": c}
+            for _l, s, a, c in rows
+        ]
+        if save_config(self.config):
+            QMessageBox.information(
+                self, "已保存",
+                f"I/O 地址库已保存（{len(rows)} 项）。\n下一次对话开始即生效。",
+            )
+        else:
+            QMessageBox.warning(self, "保存失败", "配置文件写入失败，请检查磁盘权限。")
 
 
 # ---------------- 主窗口 ----------------
@@ -1096,6 +1527,7 @@ class MainWindow(QMainWindow):
 
         self.config = load_config()
         self.executor = ToolExecutor()
+        self.executor.config = self.config
         self.assistant = Assistant(self.config, self.executor)
 
         self.chat = ChatPanel()
@@ -1110,7 +1542,10 @@ class MainWindow(QMainWindow):
 
         # Tab 0：STEP 7 AI Agent（对话 + PLC/程序面板）
         step7_tabs = QTabWidget()
-        step7_tabs.addTab(self.plc_panel, "PLC")
+        plc_scroll = QScrollArea()
+        plc_scroll.setWidgetResizable(True)
+        plc_scroll.setWidget(self.plc_panel)
+        step7_tabs.addTab(plc_scroll, "PLC")
         step7_tabs.addTab(self.code_panel, "程序")
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.chat)
@@ -1160,9 +1595,9 @@ class MainWindow(QMainWindow):
         )
         self.plc_panel.btn_add.clicked.connect(lambda: self.plc_panel.add_tag())
         self.plc_panel.btn_remove.clicked.connect(self.plc_panel.remove_selected)
+        self.plc_panel.tags_changed.connect(self._sync_poll_addresses)
         self.plc_panel.btn_write.clicked.connect(self._write_selected)
         self.plc_panel.chk_auto.toggled.connect(self._toggle_auto_poll)
-        self.plc_panel.poll_timer.timeout.connect(self.plc_panel.refresh_values)
         self.plc_panel.chk_write.toggled.connect(self._toggle_allow_write)
         self.code_panel.btn_copy.clicked.connect(self.code_panel.copy_code)
         self.code_panel.btn_export.clicked.connect(self.code_panel.export_file)
@@ -1184,6 +1619,9 @@ class MainWindow(QMainWindow):
         act_test.triggered.connect(self._test_current_connection)
         act_settings = toolbar.addAction("模型设置")
         act_settings.triggered.connect(self._open_settings)
+        act_io = toolbar.addAction("I/O 地址库")
+        act_io.setToolTip("预设元件地址，AI 生成程序/组态时直接采用")
+        act_io.triggered.connect(self._open_io_library)
         act_clear = toolbar.addAction("清空对话")
         act_clear.triggered.connect(self._clear_chat)
         act_scada = toolbar.addAction("MCGS 组态")
@@ -1195,6 +1633,10 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._conn_thread = None
         self._conn_worker = None
+        self._act_thread = None
+        self._act_worker = None
+        self._poll_thread = None
+        self._poll_worker = None
         self._settings_dialog = None
 
         self.plc_panel.refresh_status()
@@ -1212,7 +1654,9 @@ class MainWindow(QMainWindow):
             "然后就可以对我说：\n\n"
             "- “用模板生成一个星三角降压启动程序”\n"
             "- “读取 VW100 的产量值”\n"
-            "- “电机正反转怎么设计？”（可切换顶部的**学习模式**让我引导你思考）",
+            "- “电机正反转怎么设计？”（可切换顶部的**学习模式**让我引导你思考）\n\n"
+            "💡 也可以在工具栏 **「I/O 地址库」** 中预设元件地址"
+            "（如 启动按钮 = I0.0），我生成程序与组态时会直接采用这些地址。",
         )
 
     # ---------- 模型连通性测试（工具栏，测试已生效配置） ----------
@@ -1287,6 +1731,38 @@ class MainWindow(QMainWindow):
     # ---------- 连接回调 ----------
     def _on_connection_changed(self):
         self.plc_panel.refresh_status()
+        if not self.executor.connected:
+            self.plc_panel.mark_all("—")
+
+    # ---------- 通用后台动作 ----------
+    def _run_action(self, fn, on_done=None) -> bool:
+        if self._act_thread is not None:
+            QMessageBox.information(self, "提示", "上一个后台操作尚未完成，请稍候。")
+            return False
+        thread = QThread()
+        worker = ActionWorker(fn)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(lambda r: self._on_action_done(r, on_done))
+        worker.failed.connect(lambda r: self.statusBar().showMessage(f"操作失败：{r}", 5000))
+        worker.finished.connect(self._cleanup_action)
+        thread.start()
+        self._act_thread = thread
+        self._act_worker = worker
+        return True
+
+    def _on_action_done(self, result: str, on_done):
+        if on_done is not None:
+            on_done(result)
+
+    def _cleanup_action(self):
+        thread, worker = self._act_thread, self._act_worker
+        self._act_thread = None
+        self._act_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            worker.deleteLater()
 
     # ---------- PLC 面板动作 ----------
     def _toggle_mock(self):
@@ -1295,6 +1771,7 @@ class MainWindow(QMainWindow):
             if self.executor.connected and self.executor.is_mock_connection:
                 self.executor.driver.disconnect()
             self.executor.mock.stop()
+            self.plc_panel.mark_all("—")
         else:
             try:
                 self.executor.mock.start()
@@ -1304,24 +1781,34 @@ class MainWindow(QMainWindow):
 
     def _toggle_connect(self):
         if self.executor.connected:
+            # 断开为本地调用，直接执行
             self.executor.driver.disconnect()
             self.plc_panel.refresh_status()
+            self.plc_panel.mark_all("—")
             return
+        panel = self.plc_panel
+        panel.btn_connect.setEnabled(False)
         use_mock = self.executor.mock.running
-        if use_mock:
-            result = self.executor.connect_plc(use_mock=True)
-        else:
-            result = self.executor.connect_plc(
+
+        def job():
+            if use_mock:
+                return self.executor.connect_plc(use_mock=True)
+            return self.executor.connect_plc(
                 use_mock=False,
-                profile=self.plc_panel.cmb_profile.currentText(),
-                host=self.plc_panel.edt_host.text().strip(),
-                rack=self.plc_panel.spn_rack.value(),
-                slot=self.plc_panel.spn_slot.value(),
+                profile=panel.cmb_profile.currentText(),
+                host=panel.edt_host.text().strip(),
+                rack=panel.spn_rack.value(),
+                slot=panel.spn_slot.value(),
             )
-        self.statusBar().showMessage(result, 5000)
-        self.plc_panel.refresh_status()
-        self.plc_panel.refresh_values()
-        self._persist_plc_config()
+
+        def done(msg):
+            panel.btn_connect.setEnabled(True)
+            self.statusBar().showMessage(msg, 5000)
+            self.plc_panel.refresh_status()
+            self._persist_plc_config()
+
+        if not self._run_action(job, done):
+            panel.btn_connect.setEnabled(True)
 
     def _write_selected(self):
         address = self.plc_panel.selected_address()
@@ -1329,15 +1816,55 @@ class MainWindow(QMainWindow):
         if not address or value == "":
             QMessageBox.information(self, "提示", "请选中一行并填写写入值。")
             return
-        result = self.executor.write_tag(address, value)
-        self.statusBar().showMessage(result, 5000)
-        self.plc_panel.refresh_values()
+        panel = self.plc_panel
+        panel.btn_write.setEnabled(False)
 
+        def done(msg):
+            panel.btn_write.setEnabled(True)
+            self.statusBar().showMessage(msg, 5000)
+
+        if not self._run_action(lambda: self.executor.write_tag(address, value), done):
+            panel.btn_write.setEnabled(True)
+
+    # ---------- 变量监控后台轮询 ----------
     def _toggle_auto_poll(self, checked: bool):
         if checked:
-            self.plc_panel.poll_timer.start()
+            self._start_poll()
         else:
-            self.plc_panel.poll_timer.stop()
+            self._stop_poll()
+
+    def _start_poll(self):
+        if self._poll_thread is not None:
+            return
+
+        def reader(addr):
+            if not self.executor.connected:
+                return "—"
+            return self.executor.driver.read(addr)
+
+        thread = QThread()
+        worker = PollWorker(reader, self.plc_panel.watch_addresses(), 1000)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.start)
+        worker.values.connect(self.plc_panel.apply_values)
+        thread.start()
+        self._poll_thread = thread
+        self._poll_worker = worker
+
+    def _stop_poll(self):
+        thread, worker = self._poll_thread, self._poll_worker
+        self._poll_thread = None
+        self._poll_worker = None
+        if worker is not None:
+            QMetaObject.invokeMethod(worker, "stop", Qt.ConnectionType.QueuedConnection)
+        if thread is not None:
+            thread.quit()
+            thread.wait(3000)
+            worker.deleteLater()
+
+    def _sync_poll_addresses(self):
+        if self._poll_worker is not None:
+            self._poll_worker.update_addresses(self.plc_panel.watch_addresses())
 
     def _toggle_allow_write(self, checked: bool):
         self.executor.allow_write = checked
@@ -1348,6 +1875,7 @@ class MainWindow(QMainWindow):
     def _toggle_mode(self, _index: int):
         mode = self.cmb_mode.currentData()
         self.config["mode"] = mode
+        save_config(self.config)
 
     def _open_settings(self):
         dlg = SettingsDialog(self.config)
@@ -1364,6 +1892,13 @@ class MainWindow(QMainWindow):
         dlg.btn_save.clicked.connect(_save)
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.show()
+
+    def _open_io_library(self):
+        dlg = IOLibraryDialog(self.config)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.show()
+        # 持有引用，防止对话框被垃圾回收
+        self._io_library_dialog = dlg
 
     def _clear_chat(self):
         self.chat.clear_all()
@@ -1598,12 +2133,46 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "打开失败", str(e))
 
     def closeEvent(self, event):
+        # 先隐藏窗口，避免回收期间用户再触发动作
+        self.hide()
+
+        # 1) 停止变量监控轮询
+        self._stop_poll()
+
+        # 2) 回收 ScadaPanel 检测/写入线程
+        try:
+            self.scada_panel.shutdown()
+        except Exception:
+            pass
+
+        # 3) 回收通用动作线程
+        if self._act_thread is not None:
+            self._act_thread.quit()
+            self._act_thread.wait(3000)
+            if self._act_worker is not None:
+                self._act_worker.deleteLater()
+            self._act_thread = None
+            self._act_worker = None
+
+        # 4) 回收模型连通性测试线程
         if self._conn_thread is not None:
             self._conn_thread.quit()
             self._conn_thread.wait(3000)
             if self._conn_worker is not None:
                 self._conn_worker.deleteLater()
             self._conn_thread = None
+            self._conn_worker = None
+
+        # 5) 回收对话线程（可能正处在 LLM 调用中，尽力等待；仍未结束则交由进程退出回收）
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(3000)
+            if self._worker is not None:
+                self._worker.deleteLater()
+            self._thread = None
+            self._worker = None
+
+        # 6) 断开 PLC、停止模拟服务
         try:
             self.executor.driver.disconnect()
             self.executor.mock.stop()

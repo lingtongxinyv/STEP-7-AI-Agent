@@ -4,6 +4,7 @@
 
 无需任何真实硬件：
 - V 区 (DB1) 2048 字节、M 区 256 字节、I 区 32 字节、Q 区 32 字节
+- TM/CT 定时器/计数器区各 32 个元件（每个 2 字节）
 - 仅绑定 127.0.0.1，不影响外网与真实设备
 - 预设有教学演示数据
 连接模拟 PLC 时客户端使用 rack=0 / slot=2（snap7 Server 的兼容寻址）。
@@ -33,6 +34,9 @@ class MockPlc:
         self.m = bytearray(256)
         self.i = bytearray(32)
         self.q = bytearray(32)
+        # 定时器/计数器区：每个元件占 2 字节，32 个元件
+        self.tm = bytearray(64)
+        self.ct = bytearray(64)
 
     @property
     def running(self) -> bool:
@@ -49,6 +53,8 @@ class MockPlc:
             server.register_area(sa.MK, 0, self.m)
             server.register_area(sa.PE, 0, self.i)
             server.register_area(sa.PA, 0, self.q)
+            server.register_area(sa.TM, 0, self.tm)
+            server.register_area(sa.CT, 0, self.ct)
             self._seed()
             server.start_to(self.HOST, self.PORT)
         except Exception as e:
@@ -88,3 +94,8 @@ class MockPlc:
         util.set_int(self.v, 210, 0)
         # M0.0：系统运行标志
         util.set_bool(self.m, 0, 0, True)
+        # T37：定时器当前值演示
+        # 注意 snap7 Server TM/CT 区元件 N 落在缓冲字节 N、N+1（非 N*2）
+        util.set_int(self.tm, 37, 50)
+        # C1：计数器当前值演示
+        util.set_int(self.ct, 1, 12)

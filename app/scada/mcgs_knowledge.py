@@ -113,8 +113,14 @@ def mcgspro_channel_name(address: str, read_only: bool = False) -> str:
     import re
     rw_prefix = "只读" if read_only else "读写"
 
+    # SM 特殊存储器位：必须先于单字母匹配，否则 SM0.1 会被截成 S000.1
+    m = re.match(r"^(SM)(\d+)\.(\d+)$", address)
+    if m:
+        byte, bit = int(m.group(2)), int(m.group(3))
+        return f"{rw_prefix}SM{byte:03d}.{bit}"
+
     # 位地址：Axxx.x
-    m = re.match(r"^([IQMSMT])(\d+)\.(\d+)$", address)
+    m = re.match(r"^([IQM])(\d+)\.(\d+)$", address)
     if m:
         area, byte, bit = m.group(1), int(m.group(2)), int(m.group(3))
         return f"{rw_prefix}{area}{byte:03d}.{bit}"
@@ -127,8 +133,8 @@ def mcgspro_channel_name(address: str, read_only: bool = False) -> str:
         prefix_map = {"VB": "VBUB", "VW": "VWSB", "VD": "VDF"}
         return f"{rw_prefix}{prefix_map[prefix]}{offset:04d}"
 
-    # 单字母区 + 数字（如 V20, M10, I0）
-    m = re.match(r"^([IQMSMTC])(\d+)$", address)
+    # 单字母区 + 数字（如 T37, C1, M10）
+    m = re.match(r"^([IQMTC])(\d+)$", address)
     if m:
         area, offset = m.group(1), int(m.group(2))
         return f"{rw_prefix}{area}{offset:04d}"
@@ -144,7 +150,9 @@ def mcgspro_register_address(address: str) -> int:
     字节/字/双字如 VD20 → 20 （偏移量）
     """
     import re
-    m = re.match(r"^([IQMSMT])(\d+)\.(\d+)$", address)
+    if re.match(r"^SM\d+\.\d+$", address):  # SM0.1 → 0
+        return int(re.match(r"^SM(\d+)", address).group(1))
+    m = re.match(r"^([IQM])(\d+)\.(\d+)$", address)
     if m:
         return int(m.group(2))
     m = re.match(r"^([A-Za-z]+)(\d+)$", address)
@@ -386,7 +394,7 @@ def _detect_version_from_exe_path(exe_path: str) -> str:
     import os
     name = os.path.basename(exe_path).lower()
     path_lower = exe_path.lower()
-    if name == "mcgs_pro.exe" or "mcgspro" in path_lower:
+    if name in ("mcgs_pro.exe", "mcgssetpro.exe") or "mcgspro" in path_lower:
         return "McgsPro"
     if name == "mcgs_e.exe" or name == "mcgs.exe":
         # MCGS 嵌入版 vs 通用版：路径含 MCGSE_EE 或单独 McgsE.exe
@@ -535,9 +543,10 @@ def _search_drives_fast() -> str | None:
             name_lower = root_entry.lower()
             if not any(k in name_lower for k in ("mcgs", "mcgspro", "mcgse")):
                 continue
-            # 在这个目录下找任何 MCGS 相关 exe（排除卸载器/日志器等辅助工具）
+            # 在这个目录下找任何 MCGS 相关 exe（排除卸载器等辅助工具；
+            # 注意 mcgssetpro.exe 是 McgsPro 组态环境主程序，绝不能排除）
             skip_names = {"unwise.exe", "unins000.exe", "setup.exe", "install.exe",
-                          "mcgslogger.exe", "mcgssetpro.exe", "filetransporttool.exe"}
+                          "mcgslogger.exe", "filetransporttool.exe"}
             for dirpath, dirnames, filenames in os.walk(entry):
                 depth = dirpath.count(os.sep) - entry.count(os.sep)
                 if depth > 3:

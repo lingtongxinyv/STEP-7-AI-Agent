@@ -78,10 +78,12 @@ def _build_row_pro(variable, index0, protocol):
     # McgsPro 专用列
     pro_var_type = MCGSPRO_VAR_TYPE_MAP.get(dtype, "INTEGER")
     ch_name = mcgspro_channel_name(addr, read_only)
-    # 寄存器名称：取地址首字母对应中文描述
+    # 寄存器名称：识别地址区域（VB/VW/VD 归 V 区，SM 单列）
     import re
-    m = re.match(r"^([A-Za-z]+)", addr)
+    m = re.match(r"^(VB|VW|VD|SM|V|I|Q|M|T|C)", addr)
     area = m.group(1).upper() if m else "M"
+    if area in ("VB", "VW", "VD"):
+        area = "V"
     reg_name = MCGSPRO_REGISTER_NAMES.get(area, f"{area}寄存器")
     # 数据类型列：McgsPro 用中文描述
     ch_dtype_desc = MCGSPRO_CHANNEL_DTYPE_MAP.get(dtype, dtype)

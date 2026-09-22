@@ -200,6 +200,8 @@ class ToolExecutor:
         self.profile = "S7-200 SMART"
         self.is_mock_connection = False
         self.allow_write = False
+        # 应用配置（由 UI 注入；未注入时使用空 dict 保证默认 port 兜底可用）
+        self.config = {}
         # UI 注入的回调
         self.confirm_write = None          # (address, value) -> bool
         self.on_connection_changed = None  # () -> None
@@ -228,9 +230,56 @@ class ToolExecutor:
         if self.on_connection_changed:
             self.on_connection_changed()
 
+    # ---------- I/O 地址库 ----------
+    def io_library(self) -> list:
+        """用户预设的 I/O 地址库条目（未注入配置时为空）。"""
+        lib = self.config.get("io_library") or []
+        return lib if isinstance(lib, list) else []
+
+    def io_library_text(self) -> str:
+        """把地址库渲染成 Markdown 表格文本，供系统提示注入；库为空返回空串。"""
+        lib = self.io_library()
+        if not lib:
+            return ""
+        lines = ["| 元件/符号 | 地址 | 备注 |", "| --- | --- | --- |"]
+        for e in lib:
+            lines.append(
+                f"| {e.get('symbol', '')} | {e.get('address', '')} | {e.get('comment', '')} |"
+            )
+        return "\n".join(lines)
+
+    def _io_library_note(self, program: dict) -> str:
+        """地址库与模板 I/O 分配的差异提示（库为空或无差异时返回空串）。"""
+        lib = self.io_library()
+        if not lib:
+            return ""
+        io_table = program.get("io_table") or []
+        used = {addr for addr, _d in io_table}
+        by_desc = {str(d): addr for addr, d in io_table}
+        conflicts, uncovered = [], []
+        for e in lib:
+            sym, addr = str(e.get("symbol", "")), str(e.get("address", ""))
+            if not sym or not addr or addr in used:
+                continue
+            hit = by_desc.get(sym)
+            if hit:
+                conflicts.append(f"{sym}：模板用 {hit}，地址库预设 {addr}")
+            else:
+                uncovered.append(f"{sym} = {addr}")
+        if not conflicts and not uncovered:
+            return ""
+        parts = ["> ℹ️ 用户 I/O 地址库与本模板默认 I/O 分配存在差异："]
+        parts += [f"> - 地址不同：{c}" for c in conflicts]
+        parts += [f"> - 模板未用到：{u}（如需该元件请向用户确认如何增补）" for u in uncovered]
+        parts.append(
+            "> 模板程序为经验验证代码，请勿改动其地址；"
+            "如需完全按地址库生成，请向用户说明后用非标方式编写。"
+        )
+        return "\n" + "\n".join(parts)
+
     # ---------- 连接 ----------
     def connect_plc(self, use_mock=False, profile=None, host=None,
-                    rack=None, slot=None) -> str:
+                    rack=None, slot=None, port=None) -> str:
         try:
             if use_mock:
                 if not self.mock.running:
@@ -247,10 +296,12 @@ class ToolExecutor:
             host = host or pf["host"]
             rack = pf["rack"] if rack is None else rack
             slot = pf["slot"] if slot is None else slot
-            self.driver.connect(host, rack, slot)
+            if port is None:
+                port = self.config.get("plc", {}).get("port", 102)
+            self.driver.connect(host, rack, slot, port)
             self.is_mock_connection = False
             self._notify()
-            return f"已连接真机 {self.profile} @ {host}（rack={rack}, slot={slot}）。"
+            return f"已连接真机 {self.profile} @ {host}（rack={rack}, slot={slot}, port={port}）。"
         except PlcError as e:
             return f"连接失败：{e}"
 
@@ -335,6 +386,9 @@ class ToolExecutor:
                 f"\n\n> ⚠️ 已忽略未知参数：{', '.join(unknown)}。"
                 f"如需调整，请使用正确的参数 key 重新调用本工具。可用参数：{valid_txt}"
             )
+        note = self._io_library_note(program)
+        if note:
+            text += "\n\n" + note
         return text
 
     # ---------- MCGS 组态 ----------

@@ -37,8 +37,26 @@ def _safe_name(text, fallback):
     return cleaned or fallback
 
 
+# SCL 符号名中表示布尔量的关键词（不区分大小写；含中文）
+_SYMBOLIC_BOOL_KEYS = (
+    "start", "stop", "motor", "button", "run", "fault", "switch", "sensor", "limit",
+    "灯", "按钮", "电机", "限位", "报警", "开关", "运行",
+)
+
+
+def _is_symbolic_bool(address) -> bool:
+    """判断 SCL 符号地址（StartButton/Motor 等）是否为布尔量。"""
+    s = str(address)
+    if re.match(r"^(%|[IQMV]|DB\d|SM)", s, re.I):
+        return False  # 显式 PLC 地址，不走符号推断
+    low = s.lower()
+    return any(k in low or k in s for k in _SYMBOLIC_BOOL_KEYS)
+
+
 def _var_type_from_addr(address):
     """从 S7 地址派生 MCGS 变量类型。"""
+    if _is_symbolic_bool(address):
+        return "开关型"
     m = re.match(r"^([A-Z]+)", str(address))
     if m:
         return PLC_AREA_TO_VAR_TYPE.get(m.group(1), "数值型")
@@ -57,6 +75,8 @@ def _dtype_from_addr(address):
     if re.match(r"^(VW|T|C)", s):
         return "INT"
     if re.match(r"^[IQM]", s):
+        return "BOOL"
+    if _is_symbolic_bool(s):
         return "BOOL"
     return "INT"
 

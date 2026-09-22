@@ -23,6 +23,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import tempfile
 from datetime import datetime
 from typing import Optional, Callable
 
@@ -77,6 +78,42 @@ def _log_file() -> str:
     return os.path.join(_log_dir, "app.log")
 
 
+def log_dir() -> str:
+    """当前日志目录（main.py 的 fault.log 可与之放一起）。"""
+    return _log_dir
+
+
+def _dir_writable(path: str) -> bool:
+    """探测目录是否可创建并可写文件。"""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w") as f:
+            f.write("1")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_log_dir(preferred: str = None) -> str:
+    """优先用指定目录；不可写时依次回退：%LOCALAPPDATA%\\Step7AIAgent、临时目录。"""
+    candidates = [preferred]
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        candidates.append(os.path.join(local_app, "Step7AIAgent", "logs"))
+    candidates.append(os.path.join(tempfile.gettempdir(), "Step7AIAgent", "logs"))
+    seen = set()
+    for d in candidates:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        if _dir_writable(d):
+            return d
+    # 理论上 temp 一定可写；再兜底一个
+    return os.path.join(tempfile.gettempdir(), "Step7AIAgent", "logs")
+
+
 def setup_logging(log_dir: str = None, level: int = logging.INFO) -> str:
     """初始化根日志器，返回日志文件路径。
 
@@ -86,12 +123,12 @@ def setup_logging(log_dir: str = None, level: int = logging.INFO) -> str:
     if _initialized:
         return _log_file()
 
-    _log_dir = log_dir or (
+    preferred = log_dir or (
         os.path.dirname(sys.executable)
         if getattr(sys, "frozen", False)
         else os.path.dirname(os.path.abspath(sys.argv[0] or __file__))
     )
-    os.makedirs(_log_dir, exist_ok=True)
+    _log_dir = _resolve_log_dir(preferred)
 
     root = logging.getLogger()
     root.setLevel(level)
@@ -111,13 +148,15 @@ def setup_logging(log_dir: str = None, level: int = logging.INFO) -> str:
     ))
     root.addHandler(file_handler)
 
-    # 2. 控制台 handler（开发时看 print）
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-    console_handler.setFormatter(logging.Formatter(
-        "[%(levelname)-7s] %(name)s: %(message)s",
-    ))
-    root.addHandler(console_handler)
+    # 2. 控制台 handler（windowed exe / pythonw 下 stdout 为 None，跳过即可）
+    stream = sys.stdout
+    if stream is not None and hasattr(stream, "write"):
+        console_handler = logging.StreamHandler(stream)
+        console_handler.setLevel(level)
+        console_handler.setFormatter(logging.Formatter(
+            "[%(levelname)-7s] %(name)s: %(message)s",
+        ))
+        root.addHandler(console_handler)
 
     # 3. Qt 信号桥（等 MainWindow 创建后 setup_log_emitter 再转发）
     qt_handler = _QtBridgeHandler()

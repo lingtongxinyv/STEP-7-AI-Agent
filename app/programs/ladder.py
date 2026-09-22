@@ -32,6 +32,7 @@ class Contact:
 class Coil:
     addr: str
     label: str = ""
+    count: int = None  # S/R 指令的操作数量 n（如 R T37, 4）；普通线圈为 None
 
 
 @dataclass
@@ -173,8 +174,12 @@ LADDER_MAP = {
              [[[_C("T38")]],
               [[_C("stop", NC)]]],
              Coil("belt1", "上游 1 号皮带")),
-        Rung("停车后排空延时",
-             [[[_C("stop")]]],
+        Rung("停车触发排空锁存（上升沿置位，排空到时自复位）",
+             [[[_C("stop", P, "停止上升沿")], [_C("M0.1", label="自锁")]],
+              [[_C("T37", NC)]]],
+             Coil("M0.1", "停车排空锁存")),
+        Rung("排空计时（锁存保持，点按停止也能排空）",
+             [[[_C("M0.1")]]],
              FuncBox("TON", "T37", pt="stop_pt")),
     ],
     "shuttle": [
@@ -224,7 +229,7 @@ def build_ladder(program: dict):
         outs = []
         for out in rung.outputs:
             if isinstance(out, Coil):
-                outs.append(Coil(rs(out.addr), out.label))
+                outs.append(Coil(rs(out.addr), out.label, count=out.count))
             elif isinstance(out, FuncBox):
                 outs.append(
                     FuncBox(
@@ -437,8 +442,11 @@ class LadderWidget(QWidget):
                     p.drawLine(cx_c + 10, cy, rail_r, cy)
                     p.setFont(self._small)
                     p.setPen(_ADDR_COLOR)
-                    p.drawText(QRect(cx_c - 44, cy - 28, 88, 14),
-                               Qt.AlignmentFlag.AlignCenter, out.addr)
+                    addr_text = out.addr
+                    if getattr(out, "count", None) and out.count > 1:
+                        addr_text = f"{out.addr}, {out.count}"
+                    p.drawText(QRect(cx_c - 44, cy - 28, 96, 14),
+                               Qt.AlignmentFlag.AlignCenter, addr_text)
                     if out.label:
                         p.setPen(_LABEL_COLOR)
                         p.drawText(QRect(cx_c - 54, cy + 14, 108, 14),

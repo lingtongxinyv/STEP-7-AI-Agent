@@ -157,11 +157,21 @@ def _parse_network(lines: list, comment: str) -> Rung:
         elif op in ("S", "R"):
             if not oper:
                 raise UnsupportedStl(line.strip())
+            parts = [p.strip() for p in oper.split(",")]
+            addr = parts[0]
+            # 保留连续操作数量 n（默认 1）
+            count = None
+            if len(parts) >= 2:
+                try:
+                    n = int(parts[1])
+                    if n >= 1:
+                        count = n
+                except ValueError:
+                    pass
             if group is not None:
                 series.append(group)
                 group = None
-            addr = oper.split(",")[0].strip()
-            outputs.append(Coil(addr, "置位" if op == "S" else "复位"))
+            outputs.append(Coil(addr, "置位" if op == "S" else "复位", count=count))
 
         else:
             # ALD/OLD/FOR/NEXT/MOV/间接寻址等：无法可靠转为平面梯形图

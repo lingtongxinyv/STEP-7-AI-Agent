@@ -4,6 +4,7 @@ import faulthandler
 import logging
 import os
 import sys
+import tempfile
 import threading
 import traceback
 from datetime import datetime
@@ -25,11 +26,13 @@ def _report(title: str) -> None:
         log.error("%s:\n%s", title, tb)
     except Exception:
         # 日志系统可能还没初始化，兜底写文件
-        try:
-            with open(os.path.join(_base_dir(), "startup.log"), "a", encoding="utf-8") as f:
-                f.write(f"[{datetime.now():%H:%M:%S.%f}] {title}:\n{tb}\n")
-        except Exception:
-            pass
+        for d in (_base_dir(), tempfile.gettempdir()):
+            try:
+                with open(os.path.join(d, "startup.log"), "a", encoding="utf-8") as f:
+                    f.write(f"[{datetime.now():%H:%M:%S.%f}] {title}:\n{tb}\n")
+                break
+            except OSError:
+                continue
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -61,15 +64,25 @@ def _install_hooks() -> None:
 
     sys.excepthook = sys_hook
     threading.excepthook = thread_hook
-    # 捕获原生层崩溃（访问冲突等），直接写入 fault.log
+    # 捕获原生层崩溃（访问冲突等），写入 fault.log；首选日志目录，逐级兜底
+    fault_dirs = []
     try:
-        fault_path = os.path.join(_base_dir(), "fault.log")
-        fault_file = open(fault_path, "a", encoding="utf-8", errors="replace")
-        fault_file.write(f"\n===== session {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
-        fault_file.flush()
-        faulthandler.enable(fault_file)
+        from app.core.logger import log_dir
+        if log_dir():
+            fault_dirs.append(log_dir())
     except Exception:
         pass
+    fault_dirs.extend([_base_dir(), tempfile.gettempdir()])
+    for d in fault_dirs:
+        try:
+            fault_path = os.path.join(d, "fault.log")
+            fault_file = open(fault_path, "a", encoding="utf-8", errors="replace")
+            fault_file.write(f"\n===== session {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+            fault_file.flush()
+            faulthandler.enable(fault_file)
+            break
+        except OSError:
+            continue
 
 
 def main():
@@ -106,6 +119,9 @@ def main():
         app = QApplication(sys.argv)
         app.setApplicationName("STEP 7 AI Agent")
         app.setOrganizationName("Step7AIAgent")
+
+        from app.ui.theme import apply_theme
+        apply_theme(app)
 
         log.info("creating MainWindow...")
         window = MainWindow()
