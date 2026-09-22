@@ -14,7 +14,7 @@ DEFAULT_CONFIG = {
             "model": "qwen3:8b",
         },
         "cloud": {
-            # OpenAI 兼容接口，支持 DeepSeek / 通义千问兼容模式 / 智谱 / 自建端点
+            # OpenAI 兼容接口：DeepSeek / 阿里云百炼 / 智谱 / 硅基流动 / Kimi / 小米 MiMo 等
             "base_url": "https://api.deepseek.com",
             "model": "deepseek-chat",
             "api_key": "",
@@ -52,8 +52,11 @@ DEFAULT_CONFIG = {
 
 _CLOUD_PRESETS = {
     "DeepSeek": ("https://api.deepseek.com", "deepseek-chat"),
-    "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
+    "阿里云百炼": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
     "智谱GLM": ("https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
+    "硅基流动": ("https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V3"),
+    "月之暗面Kimi": ("https://api.moonshot.cn/v1", "moonshot-v1-8k"),
+    "小米MiMo": ("https://api.xiaomimimo.com/v1", "MiMo-V2-Pro"),
 }
 
 
