@@ -162,16 +162,25 @@ class ModelProbeWorker(QObject):
         super().__init__()
         self._entries = list(entries)
         self._timeout = timeout
+        self._stop = False
+
+    def stop(self):
+        """请求停止探测（对话框关闭/重探时调用），当前条目完成后即退出。"""
+        self._stop = True
 
     @Slot()
     def run(self):
         from app.agent.probe import probe_model
         for idx, entry in self._entries:
+            if self._stop:
+                break
             self.progress.emit(idx, f"正在探测 {entry.get('model', '')}……")
             try:
                 result = probe_model(entry, self._timeout)
             except Exception as e:
                 result = {"ok": False, "latency_ms": 0, "tool_support": False,
                           "coding_score": 0, "message": f"探测异常：{e}"}
+            if self._stop:
+                break
             self.probed.emit(idx, result)
         self.finished_all.emit()

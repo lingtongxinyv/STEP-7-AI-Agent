@@ -18,18 +18,26 @@ def _base_dir() -> str:
     )
 
 
-def _report(title: str) -> None:
-    """把未捕获异常写入日志并尽量弹出提示框。"""
-    tb = traceback.format_exc()
+def _report(title: str, tp=None, val=None, tb=None) -> None:
+    """把未捕获异常写入日志并尽量弹出提示框。
+
+    优先使用调用方显式传入的异常三元组：sys.excepthook 被 PySide6 在 Qt 槽
+    异常中回调时，当前线程的 sys.exc_info() 已被清空，traceback.format_exc()
+    只会得到 "NoneType: None"，真实堆栈必须从参数取。
+    """
+    if tp is not None:
+        detail = "".join(traceback.format_exception(tp, val, tb))
+    else:
+        detail = traceback.format_exc()
     try:
         log = logging.getLogger("main")
-        log.error("%s:\n%s", title, tb)
+        log.error("%s:\n%s", title, detail)
     except Exception:
         # 日志系统可能还没初始化，兜底写文件
         for d in (_base_dir(), tempfile.gettempdir()):
             try:
                 with open(os.path.join(d, "startup.log"), "a", encoding="utf-8") as f:
-                    f.write(f"[{datetime.now():%H:%M:%S.%f}] {title}:\n{tb}\n")
+                    f.write(f"[{datetime.now():%H:%M:%S.%f}] {title}:\n{detail}\n")
                 break
             except OSError:
                 continue
@@ -38,7 +46,7 @@ def _report(title: str) -> None:
 
         if QApplication.instance() is not None:
             box = QMessageBox(QMessageBox.Icon.Critical, "程序错误",
-                              f"{title}，详情见 app.log：\n\n{tb[-1200:]}")
+                              f"{title}，详情见 app.log：\n\n{detail[-1200:]}")
             box.exec()
     except Exception:
         pass
@@ -49,7 +57,7 @@ def _install_hooks() -> None:
         if issubclass(tp, KeyboardInterrupt):
             sys.__excepthook__(tp, val, tb)
             return
-        _report("未捕获的异常")
+        _report("未捕获的异常", tp, val, tb)
 
     def thread_hook(args):
         if issubclass(args.exc_type, SystemExit):

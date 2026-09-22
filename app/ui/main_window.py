@@ -118,6 +118,13 @@ class ChatPanel(QWidget):
         super().__init__()
         self._messages = []   # (role, markdown)
         self._stream_buf = None
+        self._frag_cache = []  # [i] = (原文, html片段)，避免逐 delta 重渲染全部历史
+        # 流式防抖：delta 高频到达时合并为 150ms 一次渲染，
+        # 否则长回复会以 O(delta数 × 全文) 频率做 Markdown 转换，卡死 GUI 线程
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(150)
+        self._render_timer.timeout.connect(self._rebuild)
 
         self.view = QTextBrowser()
         self.view.setOpenExternalLinks(False)
@@ -151,6 +158,7 @@ class ChatPanel(QWidget):
         self._rebuild()
 
     def begin_stream(self):
+        self._render_timer.stop()
         self._stream_buf = ""
         self._messages.append(("assistant", ""))
         self._rebuild()
@@ -160,14 +168,20 @@ class ChatPanel(QWidget):
             self.begin_stream()
         self._stream_buf += text
         self._messages[-1] = ("assistant", self._stream_buf)
-        self._rebuild()
+        # 只累积，渲染交给防抖定时器（150ms 合并一次）
+        self._render_timer.start()
 
     def end_stream(self):
         self._stream_buf = None
+        # 结束时取消防抖并做一次最终渲染
+        self._render_timer.stop()
+        self._rebuild()
 
     def clear_all(self):
         self._messages = []
         self._stream_buf = None
+        self._frag_cache = []
+        self._render_timer.stop()
         self._rebuild()
 
     def set_busy(self, busy: bool):
@@ -180,10 +194,21 @@ class ChatPanel(QWidget):
     def clear_input(self):
         self.input_box.clear()
 
+    def _frag(self, idx: int, text: str) -> str:
+        """带缓存的 markdown→html：文本未变时直接复用，流式期间只重渲染最后一条。"""
+        if idx >= len(self._frag_cache):
+            self._frag_cache.extend([None] * (idx + 1 - len(self._frag_cache)))
+        cached = self._frag_cache[idx]
+        if cached is not None and cached[0] == text:
+            return cached[1]
+        frag = _md_to_fragment(text)
+        self._frag_cache[idx] = (text, frag)
+        return frag
+
     def _rebuild(self):
         bubbles = []
-        for role, text in self._messages:
-            frag = _md_to_fragment(text)
+        for i, (role, text) in enumerate(self._messages):
+            frag = self._frag(i, text)
             if role == "user":
                 caption = (
                     '<div style="color:#6b7280;font-size:11px;margin:6px 4px 1px 0;">我</div>'
@@ -1298,12 +1323,14 @@ class SettingsDialog(QWidget):
         self.lbl_probe_hint.setText(text)
 
     def _on_probe_result(self, idx: int, result: dict):
-        if 0 <= idx < len(self._models):
+        if 0 <= idx < len(self._models) and 0 <= idx < self.tbl_models.rowCount():
             m = self._models[idx]
             for key in ("ok", "latency_ms", "tool_support", "coding_score"):
                 m[key] = result.get(key)
             m["message"] = "" if result.get("ok") else result.get("message", "探测失败")
-            self.tbl_models.item(idx, 3).setText(self._status_text(m))
+            item = self.tbl_models.item(idx, 3)
+            if item is not None:
+                item.setText(self._status_text(m))
 
     def _on_probe_done(self):
         self.lbl_probe_hint.setText(
@@ -1359,13 +1386,15 @@ class SettingsDialog(QWidget):
         self.btn_test.setEnabled(True)
         if self._test_thread is not None:
             self._test_thread.quit()
-            self._test_thread.wait()
+            self._test_thread.wait(5000)
             self._test_worker.deleteLater()
             self._test_thread = None
             self._test_worker = None
 
     def closeEvent(self, event):
-        # 关闭对话框时回收测试/探测线程，避免悬挂
+        # 关闭对话框时请求探测停止并回收线程，避免悬挂
+        if self._probe_worker is not None:
+            self._probe_worker.stop()
         for t_attr, w_attr in (("_test_thread", "_test_worker"),
                                ("_probe_thread", "_probe_worker")):
             thread = getattr(self, t_attr)
@@ -1682,7 +1711,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "模型连接失败", result["message"])
         if self._conn_thread is not None:
             self._conn_thread.quit()
-            self._conn_thread.wait()
+            self._conn_thread.wait(5000)
             self._conn_worker.deleteLater()
             self._conn_thread = None
             self._conn_worker = None
@@ -1718,7 +1747,7 @@ class MainWindow(QMainWindow):
         self.plc_panel.refresh_status()
         if self._thread:
             self._thread.quit()
-            self._thread.wait()
+            self._thread.wait(5000)
         self._thread = None
         self._worker = None
 
@@ -1761,7 +1790,7 @@ class MainWindow(QMainWindow):
         self._act_worker = None
         if thread is not None:
             thread.quit()
-            thread.wait()
+            thread.wait(5000)
             worker.deleteLater()
 
     # ---------- PLC 面板动作 ----------
