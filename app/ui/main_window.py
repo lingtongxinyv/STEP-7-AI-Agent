@@ -1909,7 +1909,6 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         dlg = SettingsDialog(self.config)
         dlg.btn_cancel.clicked.connect(dlg.close)
-        dlg.cmb_preset.currentIndexChanged.connect(dlg.apply_preset)
 
         def _save():
             self.config = dlg.result_config()
@@ -1921,6 +1920,8 @@ class MainWindow(QMainWindow):
         dlg.btn_save.clicked.connect(_save)
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.show()
+        # 持有引用，防止对话框被垃圾回收
+        self._settings_dialog = dlg
 
     def _open_io_library(self):
         dlg = IOLibraryDialog(self.config)
